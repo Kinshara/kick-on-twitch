@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.7.3
+// @version      3.7.5
 // @description  Replaces the Twitch video feed with a Kick stream, keeping Twitch chat and UI intact. Requires Tampermonkey or Violentmonkey - Greasemonkey 4 is not supported.
 // @author       Kinshara
 // @license      MIT
@@ -16,6 +16,72 @@
 // @resource     hlsjs  https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js#sha256-p4s2A9diQoyrou8hZ05NR/vE50likrKPhFunNyhJNgs=
 // @run-at       document-idle
 // ==/UserScript==
+
+// ─── Changelog ────────────────────────────────────────────────────────────────
+// 3.7.5
+//   Chore: MINI_PLAYER_COOLDOWN moved to the constants block alongside the
+//          other timing constants rather than being declared inside hookNavigation.
+//   Perf: Mini player click listener now performs cheap state checks
+//         (isKickActive, disabledForSession, initInProgress, cooldown)
+//         synchronously before scheduling a setTimeout, avoiding a timer
+//         being queued on every click during normal active playback.
+//
+// 3.7.4
+//   Fix: Kick overlay now correctly re-initialises after expanding Twitch's
+//        mini player back to full screen. Twitch restores the stream page
+//        without going through pushState, popstate, or any history API, so
+//        none of the existing navigation hooks fired. A capture-phase click
+//        listener with a short defer now detects this case and triggers
+//        re-initialisation when a stream URL is present but the overlay is not.
+//
+// 3.7.3
+//   Fix: Removed dead gestureUnlocked state variable — the BUFFER_APPENDED
+//        path that consumed it was removed in 3.7.2, leaving it set but never
+//        read. Eliminated from state, destroyKickPlayer, and doPlay.
+//   Fix: Safari native HLS fallback path now restores persisted volume/mute,
+//        sets isKickActive, updates the badge, and shows the control bar on
+//        play — previously these were all skipped, leaving the badge stuck on
+//        "TWITCH" and volume at browser default.
+//   Fix: mouseenter/mouseleave listeners on overlayContainer are now registered
+//        via addTrackedListener so they are properly removed on destroyKickPlayer,
+//        preventing a stale listener reference from persisting in memory.
+//   Fix: ResizeObserver callback no longer compares style.width (always '100%')
+//        against pixel values from contentRect (always different), making the
+//        guard always true and the conditional pointless. Simplified to an
+//        unconditional reassignment, which is a no-op when nothing has changed.
+//   Fix: getTwitchPlayerContainer() is now called before destroyKickPlayer() at
+//        both showStreamEndedToast call sites. destroyKickPlayer calls
+//        restoreTwitchVideo which can cause Twitch to remount the player,
+//        making a post-destroy container lookup unreliable.
+//   Fix: onNavigate no longer marked async — it does not await anything, and
+//        async made errors inside it disappear into unhandled promise rejections.
+//
+// 3.7.2
+//   Fix: Stream no longer loads in a paused state. MANIFEST_PARSED is now
+//        registered synchronously before loadSource(), preventing the event
+//        from being missed on fast connections where hls.js fires it during
+//        loadSource() itself. doPlay() reads volumeCache directly rather than
+//        going through an async .then() chain that could never win the race.
+//   Fix: Removed spurious centre-screen play button that appeared over an
+//        already-playing stream. All play attempts now route through a single
+//        doPlay() path; the click prompt is only shown if play() genuinely
+//        rejects (e.g. atypical browser autoplay policy).
+//   Fix: play() is always called while muted=true, with the user's saved
+//        volume/mute state restored only after the promise resolves. Eliminates
+//        a class of autoplay-policy rejections caused by unmuted play() calls.
+//   Fix: restoreTwitchVideo() mute-button click was unreachable (checked
+//        v.muted after setting it to false). Now checks before setting.
+//   Fix: gestureUnlocked flag is now reset in destroyKickPlayer() so it does
+//        not leak across channel navigations.
+//   Fix: volumeCachePromise is nulled in saveVolume() so the cached promise
+//        does not hold a stale reference after the user changes volume.
+//   Chore: Removed redundant autoplay attribute from the overlay <video>
+//          element — hls.js manages playback via play() directly and the
+//          attribute had no effect on hls.js-attached media.
+//
+// 3.7.1
+//   (previous release — see git history)
+// ──────────────────────────────────────────────────────────────────────────────
 
 // NOTE — hls.js is loaded via @resource with an SRI integrity hash, verified
 // by the userscript manager before execution. If the hash check fails the
@@ -79,6 +145,8 @@
   const LIVE_CHECK_INTERVAL_MS      = 5 * 60 * 1000;  // 5 minutes
   // Minimum gap between visibility-triggered rechecks (prevents API hammering on rapid tab-switching)
   const VISIBILITY_RECHECK_COOLDOWN = 30 * 1000;       // 30 seconds
+  // Minimum gap between mini player expand checks (expand is never faster than this)
+  const MINI_PLAYER_COOLDOWN        =  2 * 1000;       // 2 seconds
 
   const HLS_CONFIG = {
     maxBufferLength:         30,
@@ -1697,6 +1765,44 @@
     }
 
     window.addEventListener('popstate', onNavigate);
+
+    // ── Mini player expand detection ──────────────────────────────────────
+    // When the user expands Twitch's mini player back to the full stream,
+    // Twitch restores the stream page URL and player DOM without going through
+    // pushState, popstate, or any history API — so none of our other navigation
+    // hooks fire. We detect this with a capture-phase click listener that checks
+    // after each click whether we've landed on a stream page with no overlay.
+    // Cheap state checks run synchronously before the setTimeout so we avoid
+    // scheduling a timer on every click during normal active playback.
+    // Using setTimeout(0) defers the URL/DOM check by one task so Twitch's own
+    // click handler has time to update the page before we read it.
+    // Gated by: valid stream URL, overlay absent, not already initialising,
+    // not session-disabled, and a cooldown to prevent rapid re-triggers.
+    let lastMiniPlayerCheck = 0;
+    document.addEventListener('click', () => {
+      // Bail out synchronously on the common cases to avoid scheduling
+      // a timer on every click during normal active playback.
+      if (isKickActive) return;
+      if (disabledForSession) return;
+      if (initInProgress) return;
+      if (Date.now() - lastMiniPlayerCheck < MINI_PLAYER_COOLDOWN) return;
+      setTimeout(() => {
+        const channel = getTwitchChannel();
+        if (!channel) return;
+        if (document.getElementById('ks-overlay-container')) return;
+        lastMiniPlayerCheck = Date.now();
+        // Only act if the channel changed from what we last initialised for,
+        // or if we're on a stream page with no overlay and no UI panel at all —
+        // the latter covers the expand case where the channel hasn't changed.
+        if (channel !== currentChannel || !document.getElementById('ks-ui-panel')) {
+          console.info('[KickSwap] Mini player expand detected — re-initialising.');
+          // Do not call onNavigate() here — it guards against same-channel calls
+          // (channel === currentChannel) which is exactly the mini player case.
+          // Everything is already torn down; we just need to re-initialise.
+          waitForPlayer();
+        }
+      }, 0);
+    }, true);
 
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
