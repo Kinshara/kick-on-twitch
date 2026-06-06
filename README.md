@@ -25,7 +25,7 @@ A userscript that replaces the Twitch video player with a live Kick stream, keep
 ## Installation
 
 1. Install Tampermonkey or Violentmonkey for your browser
-2. Click the raw link for `kick-on-twitch.user.js` in this repository
+2. Open `kick-on-twitch.user.js` in this repository and click the **Raw** button at the top right of the file
 3. Your userscript manager will prompt you to install it, click **Install**
 
 Your manager will notify you automatically when a new version is published.
