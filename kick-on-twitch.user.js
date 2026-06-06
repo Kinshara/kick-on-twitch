@@ -46,7 +46,7 @@
 
   // ─── Bootstrap: inject hls.js from verified @resource ────────────────────
   // GM_getResourceURL returns a blob: URL for the SRI-verified resource.
-  // We inject it as a <script> and defer all initialisation until it loads.
+  // Inject it as a <script> and defer all initialisation until it loads.
   (function loadHls(cb) {
     const url = GM_getResourceURL('hlsjs');
     if (!url) { console.error('[KickSwap] hls.js resource not available — check @resource and SRI hash.'); return; }
@@ -966,7 +966,7 @@
   // ─── Overlay ──────────────────────────────────────────────────────────────
   function mountOverlay(playerContainer, twitchVideo) {
     // Hide Twitch's video visually; keep it in the DOM so React doesn't panic.
-    // Store a reference so we can detect if Twitch swaps it during an ad.
+    // Store a reference so can detect if Twitch swaps it during an ad.
     twitchVideo.style.visibility = 'hidden';
     twitchVideo.muted  = true;
     twitchVideo.pause();
@@ -1679,9 +1679,9 @@
 
   function hookNavigation() {
     // Wrap history methods to detect SPA navigations.
-    // We mark our wrapper with a sentinel so we can detect a double-wrap and
+    // mark wrapper with a sentinel so we can detect a double-wrap and
     // avoid lost events. Note: if Twitch's own router re-wraps pushState after
-    // our wrapper is in place, our wrapper becomes orphaned — this is a known
+    // wrapper is in place, wrapper becomes orphaned — this is a known
     // limitation of SPA hook injection. The popstate listener and the
     // MutationObserver on #root in waitForPlayer serve as reliable fallbacks
     // that cover navigations our pushState wrapper might miss.
