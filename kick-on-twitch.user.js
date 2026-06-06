@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.7.1
+// @version      3.7.2
 // @description  Replaces the Twitch video feed with a Kick stream, keeping Twitch chat and UI intact. Requires Tampermonkey or Violentmonkey - Greasemonkey 4 is not supported.
 // @author       Kinshara
 // @license      MIT
@@ -148,16 +148,23 @@
     } catch { return { volume: 1, muted: false }; }
   }
 
-  // loadVolumeCached returns a synchronously-resolved promise on subsequent
-  // calls within the same page load, preventing the slider flash on re-init.
-  let volumeCache = null;
+  // loadVolumeCached shares a single promise across all callers so there is
+  // only ever one GM storage read per page load. Caching the promise (not just
+  // the resolved value) means a second caller that arrives before the first has
+  // resolved still gets the same pending promise rather than firing a second
+  // GM read — eliminating the race between buildControlBar and startHlsPlayback.
+  let volumeCache        = null;  // resolved value, set once GM read completes
+  let volumeCachePromise = null;  // the single shared promise
   function loadVolumeCached() {
-    if (volumeCache) return Promise.resolve(volumeCache);
-    return loadVolume().then(v => { volumeCache = v; return v; });
+    if (volumeCache)        return Promise.resolve(volumeCache);
+    if (volumeCachePromise) return volumeCachePromise;
+    volumeCachePromise = loadVolume().then(v => { volumeCache = v; return v; });
+    return volumeCachePromise;
   }
 
   function saveVolume(volume, muted) {
-    volumeCache = { volume, muted };
+    volumeCache        = { volume, muted };
+    volumeCachePromise = null; // invalidate so loadVolumeCached re-resolves from the updated cache
     GM_setValue('ksVolume', JSON.stringify({ volume, muted }));
   }
 
@@ -542,6 +549,7 @@
     knownTwitchVideo = null;
     syncVolUI        = null;
     isKickActive     = false;
+    gestureUnlocked  = false;
 
     restoreTwitchVideo();
     updateUiBadge();
@@ -556,15 +564,14 @@
     const v = getTwitchVideo();
     if (!v) return;
     v.style.visibility = '';
-    // Unmute via the media element first so playback resumes audibly.
-    v.muted = false;
-    v.play().catch(() => {});
-    // Also click Twitch's own mute button if it exists while muted, so their
+    // Click Twitch's own mute button first if the video is muted, so their
     // React UI reflects the actual mute state (avoids a "stuck muted" icon).
     if (v.muted) {
       const muteBtn = document.querySelector('[data-a-target="player-mute-unmute-button"]');
       if (muteBtn) try { muteBtn.click(); } catch {}
     }
+    v.muted = false;
+    v.play().catch(() => {});
   }
 
   // ─── Stream-ended toast ───────────────────────────────────────────────────
@@ -626,30 +633,18 @@
     }
 
     hlsInstance = new Hls({ ...HLS_CONFIG, loader: buildGmLoader() });
-    hlsInstance.loadSource(hlsUrl);
-    hlsInstance.attachMedia(overlayVideo);
 
-    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
-      hookQualityLock();
-      overlayVideo.muted  = true;
-      overlayVideo.volume = 1;
-    });
-
-    const doPlay = () => {
-      if (!overlayVideo) return;
-      overlayVideo.play().then(() => {
-        gestureUnlocked = true;
-        isKickActive = true;
-        updateUiBadge();
-        // Brief auto-show of controls so new users discover them
-        autoShowControls();
-        removeClickPrompt();
-      }).catch(() => {
-        showClickPrompt();
-      });
+    // MANIFEST_PARSED must be registered synchronously before loadSource() so
+    // it is never missed. Volume is read from volumeCache directly — it is
+    // always populated by the time we get here because buildControlBar() calls
+    // loadVolumeCached() first and _initKickSwap awaits loadMappings() before
+    // calling mountOverlay/startHlsPlayback, giving the GM read time to settle.
+    // Fallback to safe defaults if for any reason the cache is still null.
+    const removeClickPrompt = () => {
+      const p = document.getElementById('ks-click-prompt');
+      if (p && p.parentNode) p.parentNode.removeChild(p);
     };
 
-    // Large translucent play button — satisfies Firefox's gesture requirement
     const showClickPrompt = () => {
       if (document.getElementById('ks-click-prompt') || !overlayContainer) return;
       const prompt = document.createElement('div');
@@ -686,46 +681,38 @@
       }
     };
 
-    const removeClickPrompt = () => {
-      const p = document.getElementById('ks-click-prompt');
-      if (p && p.parentNode) p.parentNode.removeChild(p);
+    const doPlay = () => {
+      if (!overlayVideo) return;
+      const { volume, muted: savedMuted } = volumeCache || { volume: 1, muted: false };
+      // play() is always called while muted=true — guaranteed to succeed under
+      // every browser autoplay policy. The real saved mute/volume state is
+      // restored only after the promise resolves so the browser never sees an
+      // unmuted autoplay attempt.
+      overlayVideo.muted = true;
+      overlayVideo.play().then(() => {
+        gestureUnlocked = true;
+        isKickActive    = true;
+        if (overlayVideo) {
+          overlayVideo.volume = volume;
+          overlayVideo.muted  = savedMuted;
+        }
+        if (syncVolUI) syncVolUI(volume, savedMuted);
+        updateUiBadge();
+        autoShowControls();
+        removeClickPrompt();
+      }).catch(() => {
+        showClickPrompt();
+      });
     };
 
-    hlsInstance.once(Hls.Events.BUFFER_APPENDED, () => {
-      if (!overlayVideo) return;
-      if (overlayVideo.readyState >= 3) {
-        if (gestureUnlocked) {
-          doPlay();
-        } else {
-          overlayVideo.play().then(() => {
-            gestureUnlocked = true;
-            isKickActive = true;
-            updateUiBadge();
-            autoShowControls();
-          }).catch(() => {
-            isKickActive = true;
-            updateUiBadge();
-            showClickPrompt();
-          });
-        }
-      } else {
-        overlayVideo.addEventListener('canplay', () => {
-          gestureUnlocked ? doPlay() : showClickPrompt();
-        }, { once: true });
-      }
+    hlsInstance.on(Hls.Events.MANIFEST_PARSED, () => {
+      hookQualityLock();
+      overlayVideo.muted = true;
+      doPlay();
     });
 
-    // Restore saved volume once the video is genuinely rendering frames.
-    // loadVolumeCached is used here so the value is already warm from
-    // buildControlBar's earlier call, eliminating the slider-flash on re-init.
-    overlayVideo.addEventListener('playing', () => {
-      loadVolumeCached().then(({ volume, muted }) => {
-        if (!overlayVideo) return;
-        overlayVideo.volume = volume;
-        overlayVideo.muted  = muted;
-        if (syncVolUI) syncVolUI(volume, muted);
-      });
-    }, { once: true });
+    hlsInstance.loadSource(hlsUrl);
+    hlsInstance.attachMedia(overlayVideo);
 
     let hasRetried = false;
     hlsInstance.on(Hls.Events.ERROR, (_, data) => {
@@ -989,7 +976,6 @@
     // listeners inside that function reference the real element.
     overlayVideo = document.createElement('video');
     overlayVideo.id          = 'ks-overlay-video';
-    overlayVideo.autoplay    = true;
     overlayVideo.playsinline = true;
     Object.assign(overlayVideo.style, {
       position:  'absolute',
