@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.7.0
+// @version      3.7.1
 // @description  Replaces the Twitch video feed with a Kick stream, keeping Twitch chat and UI intact. Requires Tampermonkey or Violentmonkey — Greasemonkey 4 is not supported.
 // @author       Kinshara
 // @license      MIT
@@ -13,7 +13,7 @@
 // @connect      kick.com
 // @connect      cdn.kick.com
 // @connect      *.live-video.net
-// @resource     hlsjs  https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js#sha256-tSKlOmn2TH8NXqy21zy3/2r2MtYBRLzQdDVN7xBE7Ek=
+// @resource     hlsjs  https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js#sha256-p4s2A9diQoyrou8hZ05NR/vE50likrKPhFunNyhJNgs=
 // @run-at       document-idle
 // ==/UserScript==
 
