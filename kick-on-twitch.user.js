@@ -2,7 +2,7 @@
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
 // @version      3.7.5
-// @description  Replaces the Twitch video feed with a Kick stream, keeping Twitch chat and UI intact. Requires Tampermonkey or Violentmonkey - Greasemonkey 4 is not supported.
+// @description  Watch Kick streams inside Twitch - chat, emotes and UI stay intact. Auto-matches channels, persists your settings, and switches back automatically when a stream ends. Requires Tampermonkey or Violentmonkey.
 // @author       Kinshara
 // @license      MIT
 // @match        https://www.twitch.tv/*
