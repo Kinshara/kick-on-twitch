@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.7.2
+// @version      3.7.3
 // @description  Replaces the Twitch video feed with a Kick stream, keeping Twitch chat and UI intact. Requires Tampermonkey or Violentmonkey - Greasemonkey 4 is not supported.
 // @author       Kinshara
 // @license      MIT
@@ -122,7 +122,6 @@
   let uiPanel           = null;
   let isKickActive        = false;
   let disabledForSession  = false; // true when user has clicked "Use Twitch" toggle; clears on channel nav
-  let gestureUnlocked     = false; // true once a user gesture has unlocked autoplay
   let apiNullStreak       = 0;     // counts consecutive API non-live / bad-shape results
   let liveCheckTimer      = null;  // setInterval handle for periodic live-status polling
   let lastVisibilityRecheck = 0;   // Date.now() of last visibility-triggered API recheck
@@ -549,7 +548,6 @@
     knownTwitchVideo = null;
     syncVolUI        = null;
     isKickActive     = false;
-    gestureUnlocked  = false;
 
     restoreTwitchVideo();
     updateUiBadge();
@@ -626,8 +624,16 @@
     if (!Hls.isSupported()) {
       const safeSrc = validateHlsUrl(hlsUrl);
       if (safeSrc && overlayVideo.canPlayType('application/vnd.apple.mpegurl')) {
-        overlayVideo.src = safeSrc;
-        overlayVideo.play().catch(() => {});
+        const { volume, muted: savedMuted } = volumeCache || { volume: 1, muted: false };
+        overlayVideo.src    = safeSrc;
+        overlayVideo.volume = volume;
+        overlayVideo.muted  = savedMuted;
+        if (syncVolUI) syncVolUI(volume, savedMuted);
+        overlayVideo.play().then(() => {
+          isKickActive = true;
+          updateUiBadge();
+          autoShowControls();
+        }).catch(() => {});
       }
       return;
     }
@@ -690,7 +696,6 @@
       // unmuted autoplay attempt.
       overlayVideo.muted = true;
       overlayVideo.play().then(() => {
-        gestureUnlocked = true;
         isKickActive    = true;
         if (overlayVideo) {
           overlayVideo.volume = volume;
@@ -727,7 +732,9 @@
         if (currentKickUser) cacheDelete(currentKickUser);
         setTimeout(() => safeReInit(), RETRY_DELAY_MS);
       } else {
-        // Second fatal error: give up gracefully, show the user a toast
+        // Second fatal error: give up gracefully, show the user a toast.
+        // Snapshot the container reference before destroy, which may cause
+        // Twitch to remount the player and invalidate a post-destroy lookup.
         console.warn('[KickSwap] Fatal HLS error on retry — falling back to Twitch.', data);
         const playerContainer = getTwitchPlayerContainer();
         destroyKickPlayer();
@@ -1005,6 +1012,7 @@
 
     // JS hover: show/hide controls and badge. Using JS rather than CSS :hover
     // keeps the controls visible while interacting with sliders and buttons.
+    // Registered via addTrackedListener so they are removed on destroyKickPlayer.
     const showControls = () => {
       const bar   = document.getElementById('ks-controls');
       const panel = document.getElementById('ks-ui-panel');
@@ -1017,20 +1025,16 @@
       if (bar)   bar.classList.remove('ks-visible');
       if (panel) panel.classList.remove('ks-visible');
     };
-    overlayContainer.addEventListener('mouseenter', showControls);
-    overlayContainer.addEventListener('mouseleave', hideControls);
+    addTrackedListener(overlayContainer, 'mouseenter', showControls);
+    addTrackedListener(overlayContainer, 'mouseleave', hideControls);
 
-    resizeObserver = new ResizeObserver((entries) => {
-      // Only update when the container's dimensions have actually changed
-      for (const entry of entries) {
-        const { width, height } = entry.contentRect;
-        if (!overlayContainer) break;
-        const cur = overlayContainer.style;
-        if (cur.width !== `${width}px` || cur.height !== `${height}px`) {
-          overlayContainer.style.width  = '100%';
-          overlayContainer.style.height = '100%';
-        }
-      }
+    resizeObserver = new ResizeObserver(() => {
+      // Re-anchor to 100% on any resize. The overlay is position:absolute and
+      // sized 100%/100% relative to playerContainer, so this is a no-op when
+      // dimensions haven't changed — no conditional needed.
+      if (!overlayContainer) return;
+      overlayContainer.style.width  = '100%';
+      overlayContainer.style.height = '100%';
     });
     resizeObserver.observe(playerContainer);
 
@@ -1517,6 +1521,8 @@
       const url = await fetchKickHlsUrl(kickUsername);
       if (!url && isKickActive) {
         console.info('[KickSwap] Periodic check: Kick stream is no longer live — falling back to Twitch.');
+        // Snapshot before destroy; restoreTwitchVideo may cause Twitch to remount
+        // the player, making a post-destroy getTwitchPlayerContainer() unreliable.
         const playerContainer = getTwitchPlayerContainer();
         destroyKickPlayer();
         showStreamEndedToast(playerContainer);
@@ -1639,7 +1645,7 @@
     watchdogObserver.observe(playerContainer, { childList: true, subtree: true });
   }
 
-  async function onNavigate() {
+  function onNavigate() {
     const newChannel = getTwitchChannel();
     if (newChannel === currentChannel) return;
     if (watchdogObserver) { watchdogObserver.disconnect(); watchdogObserver = null; }
