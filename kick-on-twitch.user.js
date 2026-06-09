@@ -6,6 +6,7 @@
 // @author       Kinshara
 // @license      MIT
 // @match        https://www.twitch.tv/*
+// @icon         data:image/svg+xml,%3Csvg width='64' height='64' viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='6' y='7' width='52' height='37' rx='4' fill='%23220a3a' stroke='%239146FF' stroke-width='4'/%3E%3Crect x='28' y='44' width='8' height='5' fill='%239146FF'/%3E%3Crect x='18' y='48' width='28' height='3' rx='1.5' fill='%239146FF'/%3E%3Cpolygon points='24%2C16 24%2C36 43%2C26' fill='%2353FC18'/%3E%3C%2Fsvg%3E
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
