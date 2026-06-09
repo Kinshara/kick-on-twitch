@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.7.5
+// @version      3.7.6
 // @description  Watch Kick streams inside Twitch - chat, emotes and UI stay intact. Auto-matches channels, persists your settings, and switches back automatically when a stream ends. Requires Tampermonkey or Violentmonkey.
 // @author       Kinshara
 // @license      MIT
@@ -143,6 +143,11 @@
     try {
       const raw = await GM_getValue('ksVolume', '{"volume":1,"muted":false}');
       const p   = JSON.parse(String(raw));
+      // Guard: p must be a plain object before we access its properties.
+      // A corrupt or wrongly-shaped value falls through to the catch defaults.
+      if (p === null || typeof p !== 'object' || Array.isArray(p)) {
+        throw new Error('ksVolume: unexpected storage shape');
+      }
       // Pre-populate slider immediately from persisted state to avoid the
       // brief flash where it shows full volume before the async resolve.
       return {
@@ -294,6 +299,13 @@
     try {
       const raw    = await GM_getValue('channelMappings', '{}');
       const parsed = JSON.parse(String(raw));
+      // Guard: parsed must be a plain object — not an array, null, or primitive.
+      // If the stored value has been corrupted or written by another code path
+      // with the wrong shape, treat it as an empty mapping and reset storage
+      // rather than letting Object.entries() throw or iterate unexpectedly.
+      if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+        throw new Error('channelMappings: unexpected storage shape');
+      }
       const clean  = {};
       for (const [k, v] of Object.entries(parsed)) {
         const sk = sanitiseUsername(k);
@@ -1606,11 +1618,11 @@
 
   async function safeReInit() {
     if (reInitGuard) return;
-    reInitGuard = true;
-    // Reset the backstop timer on every entry so rapid sequential calls
-    // (e.g. watchdog + visibility recheck firing within ms of each other)
-    // don't push the clear arbitrarily far into the future.
-    clearTimeout(reInitGuardTimer);
+    // Set the guard and backstop timer only on the first entry. Resetting the
+    // timer on every concurrent call would push the auto-clear arbitrarily far
+    // into the future (e.g. watchdog + visibilitychange firing within ms of
+    // each other), potentially keeping the guard locked until a page reload.
+    reInitGuard      = true;
     reInitGuardTimer = setTimeout(() => { reInitGuard = false; }, 15000);
     try {
       try { destroyKickPlayer(); } catch (e) {
