@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.7.6
+// @version      3.8.0
 // @description  Watch Kick streams inside Twitch - chat, emotes and UI stay intact. Auto-matches channels, persists your settings, and switches back automatically when a stream ends. Requires Tampermonkey or Violentmonkey.
 // @author       Kinshara
 // @license      MIT
@@ -131,8 +131,9 @@
   let liveCheckTimer      = null;  // setInterval handle for periodic live-status polling
   let lastVisibilityRecheck = 0;   // Date.now() of last visibility-triggered API recheck
   let initInProgress      = false; // true while initKickSwap is awaiting; blocks concurrent calls
-  // syncVolUI: set by buildControlBar so startHlsPlayback can call it without
-  // duck-punching a property onto the video element.
+  // syncVolUI: assigned from the return value of buildControlBar (via mountOverlay)
+  // so startHlsPlayback can call it without duck-punching a property onto the
+  // video element. The dependency is explicit at the call site in mountOverlay.
   let syncVolUI           = null;
 
   // ─── In-memory mappings cache (avoids a GM read on every nav) ────────────
@@ -154,7 +155,7 @@
         volume: typeof p.volume === 'number' ? Math.min(1, Math.max(0, p.volume)) : 1,
         muted:  typeof p.muted  === 'boolean' ? p.muted : false,
       };
-    } catch { return { volume: 1, muted: false }; }
+    } catch (e) { console.debug('[KickSwap] loadVolume: corrupt storage value, using defaults', e); return { volume: 1, muted: false }; }
   }
 
   // loadVolumeCached shares a single promise across all callers so there is
@@ -173,8 +174,20 @@
 
   function saveVolume(volume, muted) {
     volumeCache        = { volume, muted };
-    volumeCachePromise = null; // invalidate so loadVolumeCached re-resolves from the updated cache
+    // Resolve to the new value immediately so loadVolumeCached callers that
+    // arrive before the next GM read always get the updated state, not a
+    // stale re-read triggered by a null promise.
+    volumeCachePromise = Promise.resolve(volumeCache);
     GM_setValue('ksVolume', JSON.stringify({ volume, muted }));
+  }
+
+  // saveVolumeDebounced is used by the slider's input handler to avoid firing
+  // a GM write on every animation frame while the user is dragging. Discrete
+  // interactions (mute button, keyboard) call saveVolume directly.
+  let _saveVolumeTimer = null;
+  function saveVolumeDebounced(volume, muted) {
+    clearTimeout(_saveVolumeTimer);
+    _saveVolumeTimer = setTimeout(() => saveVolume(volume, muted), 200);
   }
 
   // ─── Icons ────────────────────────────────────────────────────────────────
@@ -259,9 +272,15 @@
     );
   }
 
+  // getTwitchVideo re-derives the container each time — fine for callers that
+  // don't have it handy. When the container is already known, use
+  // getTwitchVideoIn(container) to skip the redundant querySelector chain.
+  function getTwitchVideoIn(container) {
+    return container ? container.querySelector('video') : null;
+  }
+
   function getTwitchVideo() {
-    const c = getTwitchPlayerContainer();
-    return c ? c.querySelector('video') : null;
+    return getTwitchVideoIn(getTwitchPlayerContainer());
   }
 
   // ─── Session cache (LRU, max SESSION_CACHE_MAX entries) ──────────────────
@@ -389,7 +408,7 @@
               }
               resolve(null);
             }
-          } catch { resolve(null); }
+          } catch (e) { console.debug('[KickSwap] fetchKickHlsUrl: failed to parse API response', e); resolve(null); }
         },
         onerror()   { resolve(null); },
         ontimeout() { resolve(null); },
@@ -460,7 +479,11 @@
   }
 
   // ─── hls.js Custom Loader (CORS bypass) ───────────────────────────────────
-  function buildGmLoader() {
+  // GmLoader is built once here rather than inside startHlsPlayback so the
+  // class definition is not recreated on every stream start. The class closes
+  // only over the module-level KICK_CDN_HOSTS constant, so a single instance
+  // of the class is safe to reuse across multiple Hls instantiations.
+  const GmLoader = (() => {
     const defaultLoader = Hls.DefaultConfig.loader;
 
     class GmLoader extends defaultLoader {
@@ -542,7 +565,7 @@
     }
 
     return GmLoader;
-  }
+  })();
 
   // ─── Player ───────────────────────────────────────────────────────────────
   function destroyKickPlayer() {
@@ -599,34 +622,6 @@
     toast.textContent = 'Kick stream ended — switching back to Twitch';
     playerContainer.appendChild(toast);
 
-    // Style injected once
-    if (!document.getElementById('ks-toast-style')) {
-      const s = document.createElement('style');
-      s.id = 'ks-toast-style';
-      s.textContent = `
-        #ks-ended-toast {
-          position: absolute;
-          bottom: 60px;
-          left: 50%;
-          transform: translateX(-50%);
-          background: rgba(0,0,0,0.82);
-          color: #fff;
-          font-family: 'Inter', sans-serif;
-          font-size: 13px;
-          padding: 8px 16px;
-          border-radius: 4px;
-          border: 1px solid rgba(255,255,255,0.15);
-          z-index: 300;
-          pointer-events: none;
-          white-space: nowrap;
-          animation: ks-fadein 0.2s ease, ks-fadeout 0.4s ease 3.6s forwards;
-        }
-        @keyframes ks-fadein  { from { opacity: 0; } to { opacity: 1; } }
-        @keyframes ks-fadeout { from { opacity: 1; } to { opacity: 0; } }
-      `;
-      document.head.appendChild(s);
-    }
-
     setTimeout(() => {
       if (toast.parentNode) toast.parentNode.removeChild(toast);
     }, 4000);
@@ -655,14 +650,19 @@
       return;
     }
 
-    hlsInstance = new Hls({ ...HLS_CONFIG, loader: buildGmLoader() });
+    hlsInstance = new Hls({ ...HLS_CONFIG, loader: GmLoader });
 
     // MANIFEST_PARSED must be registered synchronously before loadSource() so
     // it is never missed. Volume is read from volumeCache directly — it is
-    // always populated by the time we get here because buildControlBar() calls
-    // loadVolumeCached() first and _initKickSwap awaits loadMappings() before
-    // calling mountOverlay/startHlsPlayback, giving the GM read time to settle.
-    // Fallback to safe defaults if for any reason the cache is still null.
+    // always populated by the time we get here because mountOverlay calls
+    // buildControlBar() which calls loadVolumeCached(), and _initKickSwap
+    // awaits loadMappings() before calling mountOverlay, giving the GM read
+    // time to settle. Fallback to safe defaults if for any reason the cache
+    // is still null.
+    // Call flow for autoplay:
+    //   MANIFEST_PARSED → doPlay
+    //     → play() resolves  → isKickActive = true, removeClickPrompt
+    //     → play() rejects   → showClickPrompt → (user clicks) → doPlay
     const removeClickPrompt = () => {
       const p = document.getElementById('ks-click-prompt');
       if (p && p.parentNode) p.parentNode.removeChild(p);
@@ -678,30 +678,6 @@
         doPlay();
       }, { once: true });
       overlayContainer.appendChild(prompt);
-
-      if (!document.getElementById('ks-click-prompt-style')) {
-        const s = document.createElement('style');
-        s.id = 'ks-click-prompt-style';
-        s.textContent = `
-          #ks-click-prompt {
-            position: absolute;
-            inset: 0;
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            background: rgba(0,0,0,0.35);
-            cursor: pointer;
-            z-index: 150;
-          }
-          #ks-click-prompt svg {
-            width: 72px;
-            height: 72px;
-            color: rgba(255,255,255,0.9);
-            filter: drop-shadow(0 2px 8px rgba(0,0,0,0.6));
-          }
-        `;
-        document.head.appendChild(s);
-      }
     };
 
     const doPlay = () => {
@@ -797,7 +773,8 @@
     const playBtn = document.createElement('button');
     playBtn.id        = 'ks-play-btn';
     playBtn.className = 'ks-ctrl-btn';
-    playBtn.title     = 'Play / Pause (Space)';
+    playBtn.title      = 'Play / Pause (Space)';
+    playBtn.setAttribute('aria-label', 'Play / Pause');
     setIcon(playBtn, 'pause');
 
     playBtn.addEventListener('click', () => {
@@ -812,7 +789,8 @@
     const muteBtn = document.createElement('button');
     muteBtn.id        = 'ks-mute-btn';
     muteBtn.className = 'ks-ctrl-btn';
-    muteBtn.title     = 'Mute / Unmute (M)';
+    muteBtn.title      = 'Mute / Unmute (M)';
+    muteBtn.setAttribute('aria-label', 'Mute / Unmute');
     setIcon(muteBtn, 'volumeHigh');
 
     // Volume slider
@@ -824,18 +802,12 @@
     volSlider.step  = '0.02';
     volSlider.value = overlayVideo ? String(overlayVideo.volume) : '1';
 
-    // syncVolUI is stored at module level so startHlsPlayback can call it
-    // directly without needing to duck-punch a property onto the video element.
-    syncVolUI = (v, m) => {
-      setIcon(muteBtn, (m || v === 0) ? 'volumeMute' : v < 0.5 ? 'volumeLow' : 'volumeHigh');
-      volSlider.value   = m ? '0' : String(v);
-      const pct = (m ? 0 : v) * 100;
-      volSlider.style.background = `linear-gradient(to right, #fff ${pct}%, rgba(255,255,255,0.3) ${pct}%)`;
-    };
-
+    // syncVolUI is declared as a named function (_syncVolUI) at the end of this
+    // function and returned to the caller. Using a forward reference here works
+    // because _syncVolUI is a function declaration, which is hoisted.
     const updateVolUI = () => {
       if (!overlayVideo) return;
-      syncVolUI(overlayVideo.volume, overlayVideo.muted);
+      _syncVolUI(overlayVideo.volume, overlayVideo.muted);
     };
 
     addTrackedListener(overlayVideo, 'volumechange', updateVolUI);
@@ -852,7 +824,9 @@
       const val = parseFloat(volSlider.value);
       overlayVideo.volume = val;
       overlayVideo.muted  = val === 0;
-      saveVolume(val, val === 0);
+      // Debounced: the slider fires continuously while dragging; we don't need
+      // a GM write on every frame. Discrete mute actions use saveVolume directly.
+      saveVolumeDebounced(val, val === 0);
       updateVolUI();
     });
 
@@ -860,7 +834,8 @@
     const syncBtn = document.createElement('button');
     syncBtn.id        = 'ks-sync-btn';
     syncBtn.className = 'ks-ctrl-btn';
-    syncBtn.title     = 'Jump to live edge (L)';
+    syncBtn.title      = 'Jump to live edge (L)';
+    syncBtn.setAttribute('aria-label', 'Jump to live edge');
     setIcon(syncBtn, 'syncLive');
     syncBtn.addEventListener('click', () => syncToLive());
 
@@ -887,7 +862,8 @@
     const fsBtn = document.createElement('button');
     fsBtn.id        = 'ks-fs-btn';
     fsBtn.className = 'ks-ctrl-btn';
-    fsBtn.title     = 'Fullscreen (F)';
+    fsBtn.title      = 'Fullscreen (F)';
+    fsBtn.setAttribute('aria-label', 'Toggle fullscreen');
     setIcon(fsBtn, 'fullscreen');
 
     fsBtn.addEventListener('click', () => toggleFullscreen());
@@ -944,7 +920,17 @@
       setIcon(muteBtn, (muted || volume === 0) ? 'volumeMute' : volume < 0.5 ? 'volumeLow' : 'volumeHigh');
     });
 
-    return bar;
+    // Return both the bar element and the volume-sync callback so the caller
+    // can assign syncVolUI explicitly rather than relying on the side-effect of
+    // buildControlBar writing to the module-level variable.
+    return { bar, syncVolUI: _syncVolUI };
+
+    function _syncVolUI(v, m) {
+      setIcon(muteBtn, (m || v === 0) ? 'volumeMute' : v < 0.5 ? 'volumeLow' : 'volumeHigh');
+      volSlider.value   = m ? '0' : String(v);
+      const pct = (m ? 0 : v) * 100;
+      volSlider.style.background = `linear-gradient(to right, #fff ${pct}%, rgba(255,255,255,0.3) ${pct}%)`;
+    }
   }
 
   function toggleFullscreen() {
@@ -1011,7 +997,11 @@
       objectFit: 'contain',
     });
 
-    const controlBar = buildControlBar();
+    const { bar: controlBar, syncVolUI: builtSyncVolUI } = buildControlBar();
+    // Assign the volume-sync callback returned by buildControlBar to the
+    // module-level variable so startHlsPlayback can call it. The dependency
+    // is now explicit at this call site rather than a hidden side-effect.
+    syncVolUI = builtSyncVolUI;
 
     overlayContainer.appendChild(overlayVideo);
     overlayContainer.appendChild(controlBar);
@@ -1115,7 +1105,7 @@
    * overlay mount time and re-hide any new element so it doesn't bleed through.
    */
   function handlePossibleAdSwap(playerContainer) {
-    const currentVideo = getTwitchVideo();
+    const currentVideo = getTwitchVideoIn(playerContainer);
     if (!currentVideo) return;
 
     if (currentVideo !== knownTwitchVideo) {
@@ -1313,6 +1303,60 @@
           user-select: none;
           flex-shrink: 0;
         }
+
+        /* ── Toasts & overlays ── */
+        #ks-ended-toast {
+          position: absolute;
+          bottom: 60px;
+          left: 50%;
+          transform: translateX(-50%);
+          background: rgba(0,0,0,0.82);
+          color: #fff;
+          font-family: 'Inter', sans-serif;
+          font-size: 13px;
+          padding: 8px 16px;
+          border-radius: 4px;
+          border: 1px solid rgba(255,255,255,0.15);
+          z-index: 300;
+          pointer-events: none;
+          white-space: nowrap;
+          animation: ks-fadein 0.2s ease, ks-fadeout 0.4s ease 3.6s forwards;
+        }
+        @keyframes ks-fadein  { from { opacity: 0; } to { opacity: 1; } }
+        @keyframes ks-fadeout { from { opacity: 1; } to { opacity: 0; } }
+        #ks-offline-badge {
+          position: absolute;
+          top: 12px;
+          left: 50%;
+          transform: translateX(-50%);
+          background: rgba(0,0,0,0.78);
+          color: #bbb;
+          font-family: 'Inter', sans-serif;
+          font-size: 12px;
+          padding: 6px 14px;
+          border-radius: 4px;
+          border: 1px solid rgba(255,255,255,0.12);
+          z-index: 300;
+          white-space: nowrap;
+          cursor: pointer;
+          animation: ks-fadein 0.2s ease, ks-fadeout 0.4s ease 5.6s forwards;
+        }
+        #ks-click-prompt {
+          position: absolute;
+          inset: 0;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: rgba(0,0,0,0.35);
+          cursor: pointer;
+          z-index: 150;
+        }
+        #ks-click-prompt svg {
+          width: 72px;
+          height: 72px;
+          color: rgba(255,255,255,0.9);
+          filter: drop-shadow(0 2px 8px rgba(0,0,0,0.6));
+        }
       `;
       document.head.appendChild(style);
     }
@@ -1337,12 +1381,14 @@
     // "Use Kick") so the label always describes what clicking will do, not the
     // current state. Initial state = Kick active (or will be), so first label
     // is "Use Twitch".
-    const twitchBtnEl = document.createElement('div');
+    const twitchBtnEl = document.createElement('button');
+    twitchBtnEl.type  = 'button';
     twitchBtnEl.id    = 'ks-twitch-btn';
     twitchBtnEl.title = 'Temporarily use Twitch for this session (does not remove your mapping)';
     twitchBtnEl.textContent = 'Use Twitch';
 
-    const editBtnEl = document.createElement('div');
+    const editBtnEl = document.createElement('button');
+    editBtnEl.type  = 'button';
     editBtnEl.id    = 'ks-edit-btn';
     editBtnEl.title = 'Set Kick username for this channel';
     editBtnEl.textContent = '✎';
@@ -1361,10 +1407,12 @@
 
     const saveBtn = document.createElement('button');
     saveBtn.id          = 'ks-save-btn';
+    saveBtn.type        = 'button';
     saveBtn.textContent = 'Save';
 
     const clearBtn = document.createElement('button');
     clearBtn.id          = 'ks-clear-btn';
+    clearBtn.type        = 'button';
     clearBtn.title       = 'Remove mapping, use auto';
     clearBtn.textContent = 'Auto';
 
@@ -1490,31 +1538,6 @@
 
     playerContainer.appendChild(badge);
 
-    if (!document.getElementById('ks-offline-badge-style')) {
-      const s = document.createElement('style');
-      s.id = 'ks-offline-badge-style';
-      s.textContent = `
-        #ks-offline-badge {
-          position: absolute;
-          top: 12px;
-          left: 50%;
-          transform: translateX(-50%);
-          background: rgba(0,0,0,0.78);
-          color: #bbb;
-          font-family: 'Inter', sans-serif;
-          font-size: 12px;
-          padding: 6px 14px;
-          border-radius: 4px;
-          border: 1px solid rgba(255,255,255,0.12);
-          z-index: 300;
-          white-space: nowrap;
-          cursor: pointer;
-          animation: ks-fadein 0.2s ease, ks-fadeout 0.4s ease 5.6s forwards;
-        }
-      `;
-      document.head.appendChild(s);
-    }
-
     setTimeout(dismiss, 6000);
   }
 
@@ -1563,6 +1586,9 @@
     }
   }
 
+  // _initKickSwap is the inner implementation. It must only be called through
+  // the public initKickSwap wrapper, which sets the initInProgress guard to
+  // prevent concurrent invocations from mountOverlay stacking overlays.
   async function _initKickSwap() {
     const channel = getTwitchChannel();
     if (!channel) return;
@@ -1675,6 +1701,8 @@
   }
 
   function waitForPlayer() {
+    // getTwitchVideo() is correct here — we don't have a container reference
+    // yet and need to discover it from scratch.
     if (getTwitchVideo()) { initKickSwap(); return; }
 
     if (playerObserver) { playerObserver.disconnect(); playerObserver = null; }
