@@ -11,6 +11,7 @@ A userscript that replaces the Twitch video player with a live Kick stream, keep
 - Detects when a Kick stream ends and switches back to Twitch automatically
 - Re-initialises correctly after expanding Twitch's mini player
 - Persists your volume and mute state across sessions
+- Rechecks Kick live status when you switch back to a tab, in case the stream came online while you were away
 - Control bar with play/pause, mute, volume slider, go-to-live-edge, and fullscreen
 - Keyboard shortcuts: `Space` play/pause, `M` mute, `F` fullscreen, `L` jump to live edge
 - "Use Twitch" session toggle to switch back temporarily without removing your mapping
@@ -20,7 +21,7 @@ A userscript that replaces the Twitch video player with a live Kick stream, keep
 ## Requirements
 
 - [Tampermonkey](https://www.tampermonkey.net/) or [Violentmonkey](https://violentmonkey.github.io/)
-- Greasemonkey 4 is **not** supported
+- Greasemonkey 4 is **not** supported — it lacks `GM_xmlhttpRequest` and `GM_getResourceURL`, both of which this script requires
 
 ## Installation
 
@@ -54,6 +55,8 @@ The script calls the Kick public API to check whether the channel is live and re
 
 All network requests to Kick's CDN go through `GM_xmlhttpRequest`, which is required to satisfy Kick's CORS policy. Every request URL is validated against an allowlist of known Kick and AWS IVS hostnames before being fetched.
 
+**A note on the `@connect *` permission:** when your userscript manager installs this script, it requests permission to contact external hosts. You will see `@connect *` (a wildcard) listed alongside the explicit `kick.com` and `cdn.kick.com` entries. The wildcard is necessary because Kick's HLS video segments are served from AWS IVS subdomains whose exact hostnames change per-stream (for example `fa723fc1b171.euw13.playlist.live-video.net`). These subdomains are too deeply nested for a wildcard entry like `*.live-video.net` to match reliably across all userscript managers. The wildcard does **not** mean the script will contact arbitrary domains — every URL is checked against the same `kick.com` / `cdn.kick.com` / `live-video.net` allowlist before any request is made.
+
 Channel mappings and volume state are persisted locally in your browser via your userscript manager.
 
 ## Troubleshooting
@@ -65,7 +68,13 @@ Check the Kick username is correct using the ✎ button. If names match and it s
 The stream token may have expired mid-session. The script retries once automatically. If it keeps happening, open the browser console and look for `[KickSwap]` error messages.
 
 **Controls not appearing**
-Hover over the video player. Controls fade in on hover and hide when the cursor leaves.
+Hover over the video player. Controls fade in on hover and hide when the cursor leaves. They also briefly appear automatically when the Kick stream first activates.
+
+**Volume resets on every load**
+Volume and mute state are saved via your userscript manager's storage. If they are not persisting, check that your manager has storage access enabled for this script (Tampermonkey: Dashboard → script → Settings → Storage).
+
+**Permission prompt for network access**
+If your userscript manager asks for permission to contact external hosts, this is expected. See the note about `@connect *` in the "How it works" section above.
 
 ## License
 
