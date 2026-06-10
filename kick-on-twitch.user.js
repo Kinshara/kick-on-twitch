@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.8.0
+// @version      3.9.3
 // @description  Watch Kick streams inside Twitch - chat, emotes and UI stay intact. Auto-matches channels, persists your settings, and switches back automatically when a stream ends. Requires Tampermonkey or Violentmonkey.
 // @author       Kinshara
 // @license      MIT
@@ -15,7 +15,20 @@
 // @grant        GM_getResourceURL
 // @connect      kick.com
 // @connect      cdn.kick.com
-// @connect      *.live-video.net
+// @connect      live-video.net
+// @connect      *
+// NOTE — @connect * is intentional and required alongside the explicit entries.
+// Kick's HLS manifests are served from deeply-nested AWS IVS subdomains whose
+// exact hostnames change per-stream (e.g. fa723fc1b171.euw13.playlist.live-video.net).
+// Tampermonkey on Chrome only suppresses its cross-origin permission popup when
+// the requested domain is matched by a @connect entry; @connect *.live-video.net
+// only matches one subdomain level deep and still triggers the popup for deeper
+// subdomains. @connect * covers those. The explicit entries above silence the
+// prompt for kick.com and cdn.kick.com (Tampermonkey prompts for named domains
+// separately even when @connect * is present).
+// The actual security boundary is GmLoader's KICK_CDN_HOSTS allowlist, which
+// validates every request URL before it is fetched — @connect * does not mean
+// the script will contact arbitrary domains.
 // @resource     hlsjs  https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js#sha256-p4s2A9diQoyrou8hZ05NR/vE50likrKPhFunNyhJNgs=
 // @run-at       document-idle
 // ==/UserScript==
@@ -39,29 +52,77 @@
 // Kick may tighten token validation tied to referrer/origin in future; if
 // streams stop loading, this is the first place to investigate.
 //
-// NOTE — @connect uses *.live-video.net to cover all AWS IVS regions Kick uses.
-// If Kick adds a new CDN provider, add its domain here and to KICK_CDN_HOSTS.
-// Because the wildcard is broad (all of *.live-video.net, not just Kick's
-// sub-prefix), the per-request host check in GmLoader is the meaningful
-// enforcement layer.
+// NOTE — @connect * covers all CDN hostnames Kick uses (deeply-nested AWS IVS
+// subdomains change per-stream; a wildcard is the only reliable approach).
+// If Kick adds a new CDN provider, add its apex domain to KICK_CDN_HOSTS below.
+// GmLoader's per-request host check is the meaningful enforcement layer.
 
 (function () {
   'use strict';
 
   // ─── Bootstrap: inject hls.js from verified @resource ────────────────────
-  // GM_getResourceURL returns a blob: URL for the SRI-verified resource.
-  // Inject it as a <script> and defer all initialisation until it loads.
+  // Tampermonkey on Chrome returns a blob: URL from GM_getResourceURL, but
+  // Twitch's Content Security Policy blocks <script src="blob:…"> outright,
+  // so the script element never loads and main() is never called.
+  // Violentmonkey on Firefox returns a moz-extension: URL which Twitch's CSP
+  // does allow, so the old src-injection worked there but not on Chrome.
+  //
+  // The fix: fetch the resource as text and inject it as an *inline* <script>.
+  // Inline scripts are evaluated from the page's JS realm (giving hls.js access
+  // to window.Hls) and are not subject to src-based CSP restrictions.
+  //
+  // We use GM_getResourceURL + fetch() as the primary path (works in both
+  // managers). If the blob URL itself is somehow blocked (future CSP tightening
+  // that restricts fetch() to blob: origins), we fall back to GM_xmlhttpRequest
+  // which bypasses CORS/CSP entirely. The SRI hash verification happens inside
+  // the userscript manager before the resource is stored; by the time we fetch
+  // the blob URL the content is already verified.
   (function loadHls(cb) {
-    const url = GM_getResourceURL('hlsjs');
-    if (!url) { console.error('[KickSwap] hls.js resource not available — check @resource and SRI hash.'); return; }
-    const s = document.createElement('script');
-    s.src = url;
-    s.onload  = cb;
-    s.onerror = () => console.error('[KickSwap] Failed to load hls.js from resource URL.');
-    document.head.appendChild(s);
+    const blobUrl = GM_getResourceURL('hlsjs');
+    if (!blobUrl) {
+      console.error('[KickSwap] hls.js resource not available — check @resource and SRI hash.');
+      return;
+    }
+
+    function injectInline(src) {
+      const s = document.createElement('script');
+      s.textContent = src;
+      document.head.appendChild(s);
+      cb();
+    }
+
+    // Primary: fetch the blob/extension URL as text, then inline-inject.
+    fetch(blobUrl)
+      .then(r => {
+        if (!r.ok) throw new Error(`fetch status ${r.status}`);
+        return r.text();
+      })
+      .then(src => injectInline(src))
+      .catch(fetchErr => {
+        // Fallback: use GM_xmlhttpRequest which bypasses all CSP/CORS restrictions.
+        // Note: blob: URLs accessed via GM_xmlhttpRequest return status 0 (not 200)
+        // because they don't go through HTTP. We therefore check for non-empty
+        // responseText directly rather than using an HTTP status range check, which
+        // would incorrectly reject a successful blob response and silently prevent
+        // hls.js from loading.
+        console.debug('[KickSwap] fetch() of hls.js resource failed, falling back to GM_xmlhttpRequest.', fetchErr);
+        GM_xmlhttpRequest({
+          method: 'GET',
+          url: blobUrl,
+          onload(resp) {
+            if (resp.responseText) {
+              injectInline(resp.responseText);
+            } else {
+              console.error('[KickSwap] GM_xmlhttpRequest fallback for hls.js also failed — empty response.');
+            }
+          },
+          onerror() { console.error('[KickSwap] Failed to load hls.js via GM_xmlhttpRequest fallback.'); },
+        });
+      });
   })(main);
 
   function main() {
+
 
   // ─── Constants ────────────────────────────────────────────────────────────
   // KICK_API_VERSION: bump here if Kick ships a v2 endpoint.
@@ -135,6 +196,12 @@
   // so startHlsPlayback can call it without duck-punching a property onto the
   // video element. The dependency is explicit at the call site in mountOverlay.
   let syncVolUI           = null;
+  // hlsRetryCount is module-level (not closure-local) so it survives the
+  // destroyKickPlayer → safeReInit cycle. A local hasRetried flag was reset to
+  // false on every new Hls instantiation, creating an infinite retry loop on
+  // Chrome/Tampermonkey where manifestLoadError recurs every attempt.
+  // Reset to 0 only on successful playback or channel navigation.
+  let hlsRetryCount       = 0;
 
   // ─── In-memory mappings cache (avoids a GM read on every nav) ────────────
   let mappingsCache     = null;  // null = not yet loaded
@@ -143,6 +210,9 @@
   async function loadVolume() {
     try {
       const raw = await GM_getValue('ksVolume', '{"volume":1,"muted":false}');
+      // GM_getValue can return undefined on a cold start in some Tampermonkey
+      // builds on Chrome even when a default is supplied. Guard before parsing.
+      if (raw === undefined || raw === null) return { volume: 1, muted: false };
       const p   = JSON.parse(String(raw));
       // Guard: p must be a plain object before we access its properties.
       // A corrupt or wrongly-shaped value falls through to the catch defaults.
@@ -317,6 +387,9 @@
     if (mappingsCache !== null) return mappingsCache;
     try {
       const raw    = await GM_getValue('channelMappings', '{}');
+      // GM_getValue can return undefined on a cold start in some Tampermonkey
+      // builds on Chrome even when a default is supplied. Guard before parsing.
+      if (raw === undefined || raw === null) { mappingsCache = {}; return {}; }
       const parsed = JSON.parse(String(raw));
       // Guard: parsed must be a plain object — not an array, null, or primitive.
       // If the stored value has been corrupted or written by another code path
@@ -521,24 +594,43 @@
 
         const isSegment = /\.(ts|mp4|m4s)(\?|$)/.test(url);
 
-        // Origin spoofing: GM_xmlhttpRequest bypasses the browser's CORS checks,
-        // allowing us to set Origin freely. Kick's CDN requires this header.
-        // CORS bypass is an accepted trade-off (see file header); host
-        // validation above is the compensating control.
+        // Origin + Referer spoofing: Kick's CDN requires Origin: kick.com.
+        // Adding Referer as well satisfies Tampermonkey's cross-origin
+        // permission check on Chrome, which in some versions gates the request
+        // on a matching Referer even when @connect is present.
         this._gmRequest = GM_xmlhttpRequest({
           method:       'GET',
           url,
           responseType: isSegment ? 'arraybuffer' : 'text',
-          headers:      { 'Origin': 'https://kick.com' },
+          headers:      { 'Origin': 'https://kick.com', 'Referer': 'https://kick.com/' },
           timeout:      15000,
 
           onload: (response) => {
             this._gmRequest = null;
             if (response.status < 200 || response.status >= 300) {
+              console.warn(`[KickSwap] GmLoader: HTTP ${response.status} for ${parsedUrl.hostname}${parsedUrl.pathname.slice(0, 60)}`);
               callbacks.onError({ code: response.status, text: response.statusText }, context, null, response.responseText);
               return;
             }
-            const dataSize = isSegment ? response.response.byteLength : response.responseText.length;
+
+            // Tampermonkey on Chrome sometimes ignores responseType:'arraybuffer'
+            // and returns a string in response.response instead of an ArrayBuffer.
+            // We must convert using charCodeAt (lossless for binary) rather than
+            // TextEncoder (which encodes as UTF-8 and corrupts bytes > 0x7F in
+            // binary .ts/.mp4 segments, producing corrupted video frames).
+            let segmentData = response.response;
+            if (isSegment && !(segmentData instanceof ArrayBuffer)) {
+              try {
+                const str = typeof segmentData === 'string' ? segmentData : String(segmentData);
+                const buf = new Uint8Array(str.length);
+                for (let i = 0; i < str.length; i++) buf[i] = str.charCodeAt(i) & 0xff;
+                segmentData = buf.buffer;
+              } catch {
+                segmentData = new ArrayBuffer(0);
+              }
+            }
+
+            const dataSize = isSegment ? segmentData.byteLength : response.responseText.length;
             const stats = {
               aborted: false, loaded: dataSize, total: 0,
               retry: 0, chunkCount: 0, bwEstimate: 0,
@@ -547,12 +639,12 @@
               buffering: { start: 0, first: 0, end: 0 },
             };
             callbacks.onSuccess(
-              { url: response.finalUrl || url, data: isSegment ? response.response : response.responseText },
+              { url: response.finalUrl || url, data: isSegment ? segmentData : response.responseText },
               stats, context, null
             );
           },
-          onerror:   () => { this._gmRequest = null; callbacks.onError({ code: 0, text: 'GM request error' }, context, null, null); },
-          ontimeout: () => { this._gmRequest = null; callbacks.onTimeout({ code: 0, text: 'GM request timeout' }, context, null); },
+          onerror:   (err) => { this._gmRequest = null; console.warn('[KickSwap] GmLoader: GM request error for', parsedUrl.hostname, err); callbacks.onError({ code: 0, text: 'GM request error' }, context, null, null); },
+          ontimeout: ()    => { this._gmRequest = null; console.warn('[KickSwap] GmLoader: GM request timeout for', parsedUrl.hostname); callbacks.onTimeout({ code: 0, text: 'GM request timeout' }, context, null); },
         });
       }
 
@@ -690,6 +782,7 @@
       overlayVideo.muted = true;
       overlayVideo.play().then(() => {
         isKickActive    = true;
+        hlsRetryCount   = 0;   // playback succeeded — reset so token expiry later still gets a retry
         if (overlayVideo) {
           overlayVideo.volume = volume;
           overlayVideo.muted  = savedMuted;
@@ -712,23 +805,25 @@
     hlsInstance.loadSource(hlsUrl);
     hlsInstance.attachMedia(overlayVideo);
 
-    let hasRetried = false;
     hlsInstance.on(Hls.Events.ERROR, (_, data) => {
       if (!data.fatal) return;
 
-      if (!hasRetried) {
+      if (hlsRetryCount < 1) {
         // First fatal error: token may have expired — invalidate the Kick cache
         // entry (using the resolved kick username, not the twitch channel name)
         // and retry after a short delay to avoid thrashing.
-        hasRetried = true;
-        console.info('[KickSwap] Fatal HLS error — invalidating cache and retrying once.', data.details);
+        // hlsRetryCount is module-level so it survives destroyKickPlayer and is
+        // not reset to 0 by a new Hls instantiation — preventing the infinite
+        // retry loop where Chrome/Tampermonkey keeps getting manifestLoadError.
+        hlsRetryCount++;
+        console.info('[KickSwap] Fatal HLS error — invalidating cache and retrying once.', data.details, data.response ?? '');
         if (currentKickUser) cacheDelete(currentKickUser);
         setTimeout(() => safeReInit(), RETRY_DELAY_MS);
       } else {
         // Second fatal error: give up gracefully, show the user a toast.
         // Snapshot the container reference before destroy, which may cause
         // Twitch to remount the player and invalidate a post-destroy lookup.
-        console.warn('[KickSwap] Fatal HLS error on retry — falling back to Twitch.', data);
+        console.warn('[KickSwap] Fatal HLS error on retry — falling back to Twitch.', data.details, data.response ?? '');
         const playerContainer = getTwitchPlayerContainer();
         destroyKickPlayer();
         showStreamEndedToast(playerContainer);
@@ -1696,6 +1791,7 @@
     destroyKickPlayer();
     destroyUiPanel();
     currentKickUser    = null;
+    hlsRetryCount      = 0;    // new channel gets a fresh retry budget
     disabledForSession = false; // reset per-channel session toggle on navigation
     waitForPlayer();
   }
@@ -1715,30 +1811,39 @@
     playerObserver.observe(root, { childList: true, subtree: true });
   }
 
+  // Module-level sentinels for the history wrapping guards.
+  // We cannot tag the native history.pushState / replaceState function objects
+  // with a custom property on Tampermonkey/Chrome because the script runs in an
+  // isolated sandbox: writes to native cross-realm function objects are silently
+  // discarded, so __ksWrapped never sticks and onNavigate fires twice on every
+  // SPA navigation. A plain module-level boolean is immune to this.
+  let _pushStateWrapped    = false;
+  let _replaceStateWrapped = false;
+
   function hookNavigation() {
     // Wrap history methods to detect SPA navigations.
-    // mark wrapper with a sentinel so we can detect a double-wrap and
-    // avoid lost events. Note: if Twitch's own router re-wraps pushState after
-    // wrapper is in place, wrapper becomes orphaned — this is a known
-    // limitation of SPA hook injection. The popstate listener and the
-    // MutationObserver on #root in waitForPlayer serve as reliable fallbacks
-    // that cover navigations our pushState wrapper might miss.
-    if (!history.pushState.__ksWrapped) {
+    // Guarded by module-level booleans (not properties on the native functions)
+    // so the sentinel survives Tampermonkey's sandbox isolation on Chrome.
+    // Note: if Twitch's own router re-wraps pushState after our wrapper is in
+    // place, our wrapper becomes orphaned — this is a known limitation of SPA
+    // hook injection. The popstate listener and the MutationObserver on #root
+    // in waitForPlayer serve as reliable fallbacks.
+    if (!_pushStateWrapped) {
       const _origPushState = history.pushState.bind(history);
       history.pushState = function (...args) {
         _origPushState(...args);
         onNavigate();
       };
-      history.pushState.__ksWrapped = true;
+      _pushStateWrapped = true;
     }
 
-    if (!history.replaceState.__ksWrapped) {
+    if (!_replaceStateWrapped) {
       const _origReplaceState = history.replaceState.bind(history);
       history.replaceState = function (...args) {
         _origReplaceState(...args);
         onNavigate();
       };
-      history.replaceState.__ksWrapped = true;
+      _replaceStateWrapped = true;
     }
 
     window.addEventListener('popstate', onNavigate);
@@ -1762,6 +1867,8 @@
       if (isKickActive) return;
       if (disabledForSession) return;
       if (initInProgress) return;
+      if (reInitGuard) return;   // safeReInit or its retry delay is in progress
+      if (hlsRetryCount > 0) return; // HLS already failed once; don't loop on every click
       if (Date.now() - lastMiniPlayerCheck < MINI_PLAYER_COOLDOWN) return;
       setTimeout(() => {
         const channel = getTwitchChannel();
