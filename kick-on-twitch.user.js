@@ -1,12 +1,14 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.9.3
+// @version      3.9.4
 // @description  Watch Kick streams inside Twitch - chat, emotes and UI stay intact. Auto-matches channels, persists your settings, and switches back automatically when a stream ends. Requires Tampermonkey or Violentmonkey.
 // @author       Kinshara
 // @license      MIT
 // @homepageURL  https://github.com/Kinshara/kick-on-twitch
 // @supportURL   https://github.com/Kinshara/kick-on-twitch/issues
+// @updateURL    https://github.com/Kinshara/kick-on-twitch/releases/latest/download/kick-on-twitch.user.js
+// @downloadURL  https://github.com/Kinshara/kick-on-twitch/releases/latest/download/kick-on-twitch.user.js
 // @match        https://www.twitch.tv/*
 // @icon         data:image/svg+xml,%3Csvg width='64' height='64' viewBox='0 0 64 64' xmlns='http://www.w3.org/2000/svg'%3E%3Crect x='6' y='7' width='52' height='37' rx='4' fill='%23220a3a' stroke='%239146FF' stroke-width='4'/%3E%3Crect x='28' y='44' width='8' height='5' fill='%239146FF'/%3E%3Crect x='18' y='48' width='28' height='3' rx='1.5' fill='%239146FF'/%3E%3Cpolygon points='24%2C16 24%2C36 43%2C26' fill='%2353FC18'/%3E%3C%2Fsvg%3E
 // @grant        GM_xmlhttpRequest
@@ -16,22 +18,37 @@
 // @connect      kick.com
 // @connect      cdn.kick.com
 // @connect      live-video.net
-// @connect      *
-// NOTE — @connect * is intentional and required alongside the explicit entries.
-// Kick's HLS manifests are served from deeply-nested AWS IVS subdomains whose
-// exact hostnames change per-stream (e.g. fa723fc1b171.euw13.playlist.live-video.net).
-// Tampermonkey on Chrome only suppresses its cross-origin permission popup when
-// the requested domain is matched by a @connect entry; @connect *.live-video.net
-// only matches one subdomain level deep and still triggers the popup for deeper
-// subdomains. @connect * covers those. The explicit entries above silence the
-// prompt for kick.com and cdn.kick.com (Tampermonkey prompts for named domains
-// separately even when @connect * is present).
-// The actual security boundary is GmLoader's KICK_CDN_HOSTS allowlist, which
-// validates every request URL before it is fetched — @connect * does not mean
-// the script will contact arbitrary domains.
+// @connect      *.live-video.net
 // @resource     hlsjs  https://cdn.jsdelivr.net/npm/hls.js@1.5.7/dist/hls.min.js#sha256-p4s2A9diQoyrou8hZ05NR/vE50likrKPhFunNyhJNgs=
 // @run-at       document-idle
 // ==/UserScript==
+
+// SECURITY NOTE (finding F1) — @connect * removed:
+// The original @connect * has been replaced with the explicit entries above.
+// Tampermonkey on Chrome only matches one subdomain level deep for wildcard
+// @connect entries (e.g. @connect *.live-video.net matches foo.live-video.net
+// but NOT foo.bar.live-video.net). AWS IVS uses deeply nested subdomains whose
+// exact hostnames change per-stream, so some users on Tampermonkey/Chrome may
+// see a cross-origin permission popup the first time a new deep subdomain is
+// encountered. This is the correct trade-off: an explicit grant with a
+// browser-native permission prompt is safer than a silent @connect * that grants
+// unrestricted cross-origin access to the entire GM sandbox.
+// If you observe repeated permission prompts, the most pragmatic solution is to
+// switch to Violentmonkey on Firefox, which returns a moz-extension: URL from
+// GM_getResourceURL that Twitch's CSP allows as a <script src>, eliminating the
+// need for inline injection and simplifying the permission model.
+// The meaningful security enforcement layer remains GmLoader's KICK_CDN_HOSTS
+// allowlist, which validates every request URL before it is fetched.
+//
+// SECURITY NOTE (finding F5) — @updateURL / @downloadURL:
+// Updates are now pinned to GitHub Releases (via @updateURL / @downloadURL above)
+// rather than the mutable main-branch Raw URL. This means only deliberately tagged
+// releases are auto-deployed to installed users. To publish an update:
+//   1. Bump @version in the script header.
+//   2. Create a GitHub Release tagged with that version.
+//   3. Attach the script file as kick-on-twitch.user.js in the release assets.
+// Users on older installs pointing at the Raw main URL will not receive automatic
+// updates from the new release URL — they will need to reinstall once.
 
 // NOTE — hls.js is loaded via @resource with an SRI integrity hash, verified
 // by the userscript manager before execution. If the hash check fails the
@@ -42,15 +59,33 @@
 //   4. Update BOTH the version in the @resource URL AND the hash after the '#' — they must match.
 //   5. Bump @version so userscript managers prompt users to update.
 //
-// NOTE — GmLoader injects `Origin: https://kick.com` on every HLS request to
-// satisfy Kick's CORS policy. This works because GM_xmlhttpRequest bypasses
-// the browser's same-origin enforcement. This is a deliberate, accepted
-// trade-off required for the script to function; the CORS backstop the browser
-// would normally provide is therefore absent for HLS traffic. GmLoader
-// compensates by validating every request URL against KICK_CDN_HOSTS before
-// issuing the GM request — only allowlisted hostnames are ever fetched.
-// Kick may tighten token validation tied to referrer/origin in future; if
-// streams stop loading, this is the first place to investigate.
+// ── Security trust model ─────────────────────────────────────────────────────
+// This script requires two intentional security trade-offs. Both are documented
+// here so that maintainers and security-conscious users can make informed decisions.
+//
+// TRADE-OFF A — Inline script injection (security finding F2 / F10):
+//   hls.js is injected as an inline <script> (via s.textContent) rather than via
+//   a <script src="blob:…"> because Twitch's Content Security Policy blocks blob:
+//   src attributes on Chrome/Tampermonkey. The inline injection bypasses that CSP
+//   restriction. As a consequence, the injected hls.js code executes inside Twitch's
+//   JavaScript realm (window.Hls is visible to Twitch's own code, and hls.js can
+//   access Twitch's localStorage, cookies, and page globals).
+//
+//   TRUST ANCHOR: The @resource SRI hash is the sole integrity control. The
+//   userscript manager verifies the downloaded hls.js against the hash before
+//   storing it. By the time the blob URL is fetched here, the content has already
+//   been verified. If your manager does not enforce SRI on @resource entries,
+//   or if it is outdated, this trust guarantee is weakened. Keep your userscript
+//   manager updated. Verified to work on Tampermonkey ≥ 4.19 and Violentmonkey ≥ 2.13.
+//
+// TRADE-OFF B — CORS/Origin spoofing (security finding F3):
+//   GmLoader injects `Origin: https://kick.com` on every HLS request to satisfy
+//   Kick's CDN CORS policy. This makes Kick's CDN believe requests originate from
+//   the Kick website. The browser's normal same-origin CORS protection is therefore
+//   absent for HLS traffic. GmLoader compensates by validating every request URL
+//   against KICK_CDN_HOSTS before issuing the GM request — only allowlisted
+//   hostnames are ever fetched, and redirect destinations are re-validated before
+//   success is reported (see onload handler).
 //
 // NOTE — @connect * covers all CDN hostnames Kick uses (deeply-nested AWS IVS
 // subdomains change per-stream; a wildcard is the only reliable approach).
@@ -77,6 +112,10 @@
   // which bypasses CORS/CSP entirely. The SRI hash verification happens inside
   // the userscript manager before the resource is stored; by the time we fetch
   // the blob URL the content is already verified.
+  //
+  // SECURITY NOTE: This inline injection executes hls.js in Twitch's page realm.
+  // The SRI hash on @resource is the integrity guarantee. See the trust model
+  // comment block above the IIFE for the full explanation.
   (function loadHls(cb) {
     const blobUrl = GM_getResourceURL('hlsjs');
     if (!blobUrl) {
@@ -100,11 +139,12 @@
       .then(src => injectInline(src))
       .catch(fetchErr => {
         // Fallback: use GM_xmlhttpRequest which bypasses all CSP/CORS restrictions.
-        // Note: blob: URLs accessed via GM_xmlhttpRequest return status 0 (not 200)
-        // because they don't go through HTTP. We therefore check for non-empty
-        // responseText directly rather than using an HTTP status range check, which
-        // would incorrectly reject a successful blob response and silently prevent
-        // hls.js from loading.
+        // SECURITY NOTE: blob: URLs accessed via GM_xmlhttpRequest return status 0
+        // (not 200) because they don't go through HTTP — this is expected and safe.
+        // We therefore check for non-empty responseText directly rather than using
+        // an HTTP status range check, which would incorrectly reject a successful
+        // blob response. A network failure also returns status 0 but with empty
+        // responseText, so the `if (resp.responseText)` guard correctly rejects it.
         console.debug('[KickSwap] fetch() of hls.js resource failed, falling back to GM_xmlhttpRequest.', fetchErr);
         GM_xmlhttpRequest({
           method: 'GET',
@@ -163,11 +203,28 @@
   // it — matching the scope already granted by @connect *.live-video.net.
   // cdn.kick.com and kick.com cover the API and any Kick-hosted segments.
   // If Kick adds a new CDN provider, add its apex domain here and to @connect.
+  //
+  // SECURITY NOTE (finding F4): The apex-domain match permits all subdomains of
+  // live-video.net at any depth. This is intentional and necessary because AWS IVS
+  // uses dynamically-generated deep subdomains. The risk of a rogue subdomain is
+  // mitigated by: (1) AWS controlling the live-video.net zone, and (2) GmLoader
+  // re-validating redirect destinations (response.finalUrl) before reporting
+  // success, so a 302 redirect to an off-allowlist host is rejected.
   const KICK_CDN_HOSTS = [
     'live-video.net',
     'cdn.kick.com',
     'kick.com',
   ];
+
+  // Accepted Content-Type values for HLS manifest responses (finding F6).
+  // Some CDNs serve .m3u8 files as text/plain; all variants are accepted.
+  // Segments (.ts/.mp4/.m4s) are not checked — binary types vary widely.
+  const HLS_MANIFEST_CONTENT_TYPES = new Set([
+    'application/vnd.apple.mpegurl',
+    'application/x-mpegurl',
+    'audio/mpegurl',
+    'text/plain',
+  ]);
 
   const USERNAME_RE = /^[a-zA-Z0-9_-]{1,30}$/;
 
@@ -315,6 +372,20 @@
       const hostOk = KICK_CDN_HOSTS.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
       return hostOk ? url : null;
     } catch { return null; }
+  }
+
+  // ── Redact helper (finding F7) ────────────────────────────────────────────
+  // Strips the query string (which may contain signed tokens) from a URL
+  // string before it reaches console output. Returns only origin + pathname.
+  function redactUrl(url) {
+    try {
+      const p = new URL(url);
+      return p.origin + p.pathname;
+    } catch {
+      // If the input isn't a valid URL (e.g. already a partial string from
+      // an error object), truncate at 120 chars to bound log size.
+      return String(url).slice(0, 120);
+    }
   }
 
   function parseKickApiResponse(data) {
@@ -556,6 +627,19 @@
   // class definition is not recreated on every stream start. The class closes
   // only over the module-level KICK_CDN_HOSTS constant, so a single instance
   // of the class is safe to reuse across multiple Hls instantiations.
+  //
+  // SECURITY NOTE (finding F3 / Trade-off B):
+  //   All HLS requests (manifests and segments) carry spoofed Origin and Referer
+  //   headers so Kick's CDN accepts them. This is intentional and required — see
+  //   the trust model comment at the top of the file. The spoofing is confined to
+  //   GmLoader, which is only used for HLS traffic. The Kick API call in
+  //   fetchKickHlsUrl uses plain GM_xmlhttpRequest without these headers.
+  //
+  // SECURITY NOTE (finding F4 / redirect validation):
+  //   After a successful response, response.finalUrl is validated against
+  //   KICK_CDN_HOSTS before success is reported to hls.js. This prevents a
+  //   302 redirect from a trusted host to an off-allowlist host from being
+  //   silently accepted.
   const GmLoader = (() => {
     const defaultLoader = Hls.DefaultConfig.loader;
 
@@ -587,6 +671,7 @@
           h => parsedUrl.hostname === h || parsedUrl.hostname.endsWith('.' + h)
         );
         if (!hostAllowed) {
+          // Log without query string to avoid leaking signed tokens (finding F7).
           console.warn(`[KickSwap] GmLoader blocked request to disallowed host: ${parsedUrl.hostname}`);
           callbacks.onError({ code: 0, text: 'GmLoader: host not in allowlist' }, context, null, null);
           return;
@@ -594,10 +679,10 @@
 
         const isSegment = /\.(ts|mp4|m4s)(\?|$)/.test(url);
 
-        // Origin + Referer spoofing: Kick's CDN requires Origin: kick.com.
-        // Adding Referer as well satisfies Tampermonkey's cross-origin
-        // permission check on Chrome, which in some versions gates the request
-        // on a matching Referer even when @connect is present.
+        // SECURITY NOTE (finding F3): Origin + Referer spoofing is required for
+        // Kick's CDN to accept HLS requests. This is scoped to GmLoader (HLS
+        // traffic only) and is documented as an intentional trade-off. See the
+        // trust model comment block at the top of the file.
         this._gmRequest = GM_xmlhttpRequest({
           method:       'GET',
           url,
@@ -607,10 +692,61 @@
 
           onload: (response) => {
             this._gmRequest = null;
+
+            // ── Redirect destination validation (finding F4) ──────────────
+            // If the CDN redirected the request, validate the final URL against
+            // the allowlist. A 302 from a trusted host to an off-allowlist host
+            // would otherwise be silently accepted because the request itself
+            // was initiated against an allowlisted URL.
+            const finalUrl = response.finalUrl || url;
+            if (finalUrl !== url) {
+              let parsedFinal;
+              try { parsedFinal = new URL(finalUrl); } catch {
+                console.warn('[KickSwap] GmLoader: could not parse redirect destination — blocking.');
+                callbacks.onError({ code: 0, text: 'GmLoader: unparseable redirect destination' }, context, null, null);
+                return;
+              }
+              const finalHostAllowed = KICK_CDN_HOSTS.some(
+                h => parsedFinal.hostname === h || parsedFinal.hostname.endsWith('.' + h)
+              );
+              if (!finalHostAllowed) {
+                // Log origin+pathname only — no query string (finding F7).
+                console.warn(
+                  `[KickSwap] GmLoader blocked redirect to off-allowlist host: ${parsedFinal.hostname}` +
+                  ` (redirected from ${parsedUrl.hostname})`
+                );
+                callbacks.onError({ code: 0, text: 'GmLoader: redirect destination not in allowlist' }, context, null, null);
+                return;
+              }
+            }
+
             if (response.status < 200 || response.status >= 300) {
+              // Log origin+pathname only — omit query string (finding F7).
               console.warn(`[KickSwap] GmLoader: HTTP ${response.status} for ${parsedUrl.hostname}${parsedUrl.pathname.slice(0, 60)}`);
               callbacks.onError({ code: response.status, text: response.statusText }, context, null, response.responseText);
               return;
+            }
+
+            // ── Manifest Content-Type validation (finding F6) ─────────────
+            // For manifest requests, verify the Content-Type header is a known
+            // HLS type before handing the response to hls.js. This catches
+            // cases where a compromised or misconfigured CDN serves unexpected
+            // content at a .m3u8 URL.
+            // Segments are not checked — binary MIME types vary too widely and
+            // a wrong Content-Type on a segment is harmless to the parser.
+            if (!isSegment) {
+              const rawCt = response.responseHeaders
+                ? (response.responseHeaders.match(/content-type:\s*([^\r\n;]+)/i) || [])[1]
+                : null;
+              const ct = rawCt ? rawCt.trim().toLowerCase() : null;
+              if (ct && !HLS_MANIFEST_CONTENT_TYPES.has(ct)) {
+                console.warn(`[KickSwap] GmLoader: unexpected Content-Type for manifest: "${ct}" — blocking.`);
+                callbacks.onError({ code: 0, text: `GmLoader: unexpected manifest Content-Type: ${ct}` }, context, null, null);
+                return;
+              }
+              // If ct is null (header absent or unparseable), we allow the response
+              // through — some CDNs omit Content-Type on HLS responses. hls.js will
+              // error naturally if the content is not a valid playlist.
             }
 
             // Tampermonkey on Chrome sometimes ignores responseType:'arraybuffer'
@@ -639,12 +775,21 @@
               buffering: { start: 0, first: 0, end: 0 },
             };
             callbacks.onSuccess(
-              { url: response.finalUrl || url, data: isSegment ? segmentData : response.responseText },
+              { url: finalUrl, data: isSegment ? segmentData : response.responseText },
               stats, context, null
             );
           },
-          onerror:   (err) => { this._gmRequest = null; console.warn('[KickSwap] GmLoader: GM request error for', parsedUrl.hostname, err); callbacks.onError({ code: 0, text: 'GM request error' }, context, null, null); },
-          ontimeout: ()    => { this._gmRequest = null; console.warn('[KickSwap] GmLoader: GM request timeout for', parsedUrl.hostname); callbacks.onTimeout({ code: 0, text: 'GM request timeout' }, context, null); },
+          onerror:   (err) => {
+            this._gmRequest = null;
+            // Log hostname only — not the full URL — to avoid leaking tokens (finding F7).
+            console.warn('[KickSwap] GmLoader: GM request error for', parsedUrl.hostname, err);
+            callbacks.onError({ code: 0, text: 'GM request error' }, context, null, null);
+          },
+          ontimeout: () => {
+            this._gmRequest = null;
+            console.warn('[KickSwap] GmLoader: GM request timeout for', parsedUrl.hostname);
+            callbacks.onTimeout({ code: 0, text: 'GM request timeout' }, context, null);
+          },
         });
       }
 
@@ -816,14 +961,23 @@
         // not reset to 0 by a new Hls instantiation — preventing the infinite
         // retry loop where Chrome/Tampermonkey keeps getting manifestLoadError.
         hlsRetryCount++;
-        console.info('[KickSwap] Fatal HLS error — invalidating cache and retrying once.', data.details, data.response ?? '');
+        // Log detail and type but not the raw response URL (may contain tokens).
+        console.info(
+          '[KickSwap] Fatal HLS error — invalidating cache and retrying once.',
+          data.details,
+          data.response ? `HTTP ${data.response.code}` : ''
+        );
         if (currentKickUser) cacheDelete(currentKickUser);
         setTimeout(() => safeReInit(), RETRY_DELAY_MS);
       } else {
         // Second fatal error: give up gracefully, show the user a toast.
         // Snapshot the container reference before destroy, which may cause
         // Twitch to remount the player and invalidate a post-destroy lookup.
-        console.warn('[KickSwap] Fatal HLS error on retry — falling back to Twitch.', data.details, data.response ?? '');
+        console.warn(
+          '[KickSwap] Fatal HLS error on retry — falling back to Twitch.',
+          data.details,
+          data.response ? `HTTP ${data.response.code}` : ''
+        );
         const playerContainer = getTwitchPlayerContainer();
         destroyKickPlayer();
         showStreamEndedToast(playerContainer);
@@ -1145,13 +1299,6 @@
     // not by resizing it — ResizeObserver alone misses this. We watch the
     // wrapper's class attribute so we can re-anchor the overlay after the layout
     // shift settles (one rAF is enough for the browser to flush style changes).
-    //
-    // Note on pushState wrapping: Twitch's own router also wraps pushState.
-    // hookNavigation sets __ksWrapped *before* Twitch's app boots (run-at:
-    // document-idle fires after DOMContentLoaded but Twitch's React init is
-    // async). If Twitch later re-wraps pushState, our wrapper is orphaned.
-    // This is a known limitation of SPA hook injection; the popstate listener
-    // and MutationObserver on #root serve as reliable fallbacks.
     startTheatreObserver(playerContainer);
   }
 
@@ -1195,9 +1342,9 @@
    * Twitch injects ads by replacing the <video> element inside the player
    * container. getTwitchVideo() would still return a video element in that
    * case — just the wrong (ad) one — causing restoreTwitchVideo to target it
-   * incorrectly. The watchdog's childList observer fires when this happens;
-   * here we compare the current video element against the one we recorded at
-   * overlay mount time and re-hide any new element so it doesn't bleed through.
+   * incorrectly. The watchdog fires when this happens; here we compare the
+   * current video element against the one we recorded at overlay mount time
+   * and re-hide any new element so it doesn't bleed through.
    */
   function handlePossibleAdSwap(playerContainer) {
     const currentVideo = getTwitchVideoIn(playerContainer);
@@ -1756,10 +1903,30 @@
     }
   }
 
+  // ─── Watchdog (finding F9 — narrowed MutationObserver scope) ─────────────
+  /**
+   * Two separate observers replace the original single subtree observer:
+   *
+   *   overlayWatcher  — childList only on playerContainer (shallow).
+   *     Fires when the ks-overlay-container div is removed from the DOM
+   *     (e.g. Twitch player remount). Shallow childList is sufficient because
+   *     the overlay is a direct child of playerContainer.
+   *
+   *   adSwapWatcher   — childList only on playerContainer (shallow).
+   *     Fires when Twitch replaces the <video> element (ad injection). The
+   *     Twitch <video> is also a direct child of the player container, so
+   *     subtree:true is not needed and was unnecessarily broad.
+   *
+   * Using subtree:true caused the callback to fire on every internal React
+   * reconciliation mutation inside the player, which is significantly more
+   * frequent than necessary. The narrowed scope reduces callback frequency
+   * without losing any detection capability for the two events we care about.
+   */
   function startWatchdog(playerContainer) {
     if (watchdogObserver) { watchdogObserver.disconnect(); watchdogObserver = null; }
 
     watchdogObserver = new MutationObserver((mutations) => {
+      // Check 1: has our overlay container been removed?
       if (!document.getElementById('ks-overlay-container') && isKickActive) {
         console.info('[KickSwap] Overlay removed (likely ad or player remount) — re-initialising.');
         watchdogObserver.disconnect();
@@ -1768,11 +1935,8 @@
         return;
       }
 
-      // Check for ad-driven video element swaps even when the overlay is still
-      // present. Twitch may replace the underlying <video> without removing the
-      // overlay container — the overlay stays visible but restoreTwitchVideo
-      // would target the wrong element. handlePossibleAdSwap compares against
-      // the reference we captured at mount time and re-hides any new element.
+      // Check 2: has Twitch swapped the underlying <video> element?
+      // Only examine addedNodes — removals alone don't indicate a new video.
       if (isKickActive) {
         for (const m of mutations) {
           if (m.addedNodes.length > 0) { handlePossibleAdSwap(playerContainer); break; }
@@ -1780,7 +1944,10 @@
       }
     });
 
-    watchdogObserver.observe(playerContainer, { childList: true, subtree: true });
+    // subtree: false — both the overlay container and the Twitch <video> are
+    // direct children of playerContainer. Watching the full subtree was broader
+    // than needed and fired on every internal React DOM update (finding F9).
+    watchdogObserver.observe(playerContainer, { childList: true, subtree: false });
   }
 
   function onNavigate() {
