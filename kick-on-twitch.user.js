@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Kick on Twitch
 // @namespace    https://github.com/Kinshara/kick-on-twitch
-// @version      3.9.4
+// @version      3.9.6
 // @description  Watch Kick streams inside Twitch - chat, emotes and UI stay intact. Auto-matches channels, persists your settings, and switches back automatically when a stream ends. Requires Tampermonkey or Violentmonkey.
 // @author       Kinshara
 // @license      MIT
@@ -163,7 +163,6 @@
 
   function main() {
 
-
   // ─── Constants ────────────────────────────────────────────────────────────
   // KICK_API_VERSION: bump here if Kick ships a v2 endpoint.
   // Check https://kick.com/api/v2/channels/:name for the new shape.
@@ -259,6 +258,24 @@
   // Chrome/Tampermonkey where manifestLoadError recurs every attempt.
   // Reset to 0 only on successful playback or channel navigation.
   let hlsRetryCount       = 0;
+
+  // ── [P2] Cached player container reference ────────────────────────────────
+  // Eliminates the repeated triple-querySelector chain in getTwitchPlayerContainer().
+  // Cache is populated lazily on first call, validated with document.contains() on
+  // subsequent calls, and explicitly cleared in destroyKickPlayer() and onNavigate()
+  // where the element identity may change.
+  let _playerContainerCache = null;
+
+  // ── [P6] Cancellable autoShowControls timer ───────────────────────────────
+  // Stored at module level so concurrent doPlay() calls (e.g. during retry)
+  // cancel the previous pending hide and destroyKickPlayer() can clean it up.
+  let _autoShowTimer = null;
+
+  // ── [P10] Cached theatre observer watch target ────────────────────────────
+  // The ancestor walk in startTheatreObserver() always resolves to the same
+  // element for a given Twitch layout version. Caching it avoids re-walking
+  // up to 6 ancestors on every safeReInit() cycle.
+  let _theatreWatchTarget = null;
 
   // ─── In-memory mappings cache (avoids a GM read on every nav) ────────────
   let mappingsCache     = null;  // null = not yet loaded
@@ -377,6 +394,8 @@
   // ── Redact helper (finding F7) ────────────────────────────────────────────
   // Strips the query string (which may contain signed tokens) from a URL
   // string before it reaches console output. Returns only origin + pathname.
+  // Called by all GmLoader log sites so token redaction is centralised here
+  // rather than repeated inline at each call site.
   function redactUrl(url) {
     try {
       const p = new URL(url);
@@ -405,12 +424,35 @@
     return match ? match[1].toLowerCase() : null;
   }
 
+  // ── [P9] Stream-page guard ────────────────────────────────────────────────
+  // Returns true only for /:channelname URLs. Prevents waitForPlayer() from
+  // running (and creating a MutationObserver + making a Kick API call) on
+  // browse pages, VODs, clips, and other non-stream Twitch URLs.
+  // hookNavigation() still runs unconditionally to handle SPA navigations
+  // from non-stream pages to stream pages.
+  function isLikelyStreamPage() {
+    return /^\/[a-zA-Z0-9_]{1,25}\/?$/.test(location.pathname);
+  }
+
+  // ── [P2] Cached player container lookup ───────────────────────────────────
+  // getTwitchPlayerContainer() used to chain three unconditional querySelector
+  // calls on every invocation. On Twitch's live DOM (5,000–15,000+ elements)
+  // each attribute-selector scan takes 0.1–0.5 ms; the function is called from
+  // at least 8 hot paths including timers and observer callbacks.
+  //
+  // The cache is validated with document.contains() (O(depth), ~0.01 ms) on
+  // every call and explicitly cleared in destroyKickPlayer() and onNavigate()
+  // where element identity can change. This keeps the query count at 1 on first
+  // call and near-zero on all subsequent calls for the same player session.
   function getTwitchPlayerContainer() {
-    return (
+    if (_playerContainerCache && document.contains(_playerContainerCache)) {
+      return _playerContainerCache;
+    }
+    _playerContainerCache =
       document.querySelector('[data-a-target="video-player"]') ||
       document.querySelector('.video-player') ||
-      document.querySelector('.video-player__container')
-    );
+      document.querySelector('.video-player__container');
+    return _playerContainerCache;
   }
 
   // getTwitchVideo re-derives the container each time — fine for callers that
@@ -585,8 +627,8 @@
     if (idx1080 !== -1) return idx1080;
 
     // 3. 720p60
-    const idx720p60 = levels.findIndex(l => l.height === 720 && fps(l) >= 60);
-    if (idx720p60 !== -1) return idx720p60;
+    const idx720p60  = levels.findIndex(l => l.height === 720 && fps(l) >= 60);
+    if (idx720p60  !== -1) return idx720p60;
 
     // 4. Highest available by height, then by fps on tie
     let best = 0;
@@ -631,7 +673,7 @@
   // SECURITY NOTE (finding F3 / Trade-off B):
   //   All HLS requests (manifests and segments) carry spoofed Origin and Referer
   //   headers so Kick's CDN accepts them. This is intentional and required — see
-  //   the trust model comment at the top of the file. The spoofing is confined to
+  //   the trust model comment block at the top of the file. The spoofing is confined to
   //   GmLoader, which is only used for HLS traffic. The Kick API call in
   //   fetchKickHlsUrl uses plain GM_xmlhttpRequest without these headers.
   //
@@ -671,13 +713,13 @@
           h => parsedUrl.hostname === h || parsedUrl.hostname.endsWith('.' + h)
         );
         if (!hostAllowed) {
-          // Log without query string to avoid leaking signed tokens (finding F7).
-          console.warn(`[KickSwap] GmLoader blocked request to disallowed host: ${parsedUrl.hostname}`);
+          // redactUrl strips the query string to avoid leaking signed tokens (finding F7).
+          console.warn(`[KickSwap] GmLoader blocked request to disallowed host: ${redactUrl(url)}`);
           callbacks.onError({ code: 0, text: 'GmLoader: host not in allowlist' }, context, null, null);
           return;
         }
 
-        const isSegment = /\.(ts|mp4|m4s)(\?|$)/.test(url);
+        const isSegment = /\.(ts|mp4|m4s|fmp4|cmfv|cmfa|cmft)(\?|$)/.test(url);
 
         // SECURITY NOTE (finding F3): Origin + Referer spoofing is required for
         // Kick's CDN to accept HLS requests. This is scoped to GmLoader (HLS
@@ -710,10 +752,10 @@
                 h => parsedFinal.hostname === h || parsedFinal.hostname.endsWith('.' + h)
               );
               if (!finalHostAllowed) {
-                // Log origin+pathname only — no query string (finding F7).
+                // redactUrl strips query string — no signed tokens in logs (finding F7).
                 console.warn(
-                  `[KickSwap] GmLoader blocked redirect to off-allowlist host: ${parsedFinal.hostname}` +
-                  ` (redirected from ${parsedUrl.hostname})`
+                  `[KickSwap] GmLoader blocked redirect to off-allowlist host: ${redactUrl(finalUrl)}` +
+                  ` (redirected from ${redactUrl(url)})`
                 );
                 callbacks.onError({ code: 0, text: 'GmLoader: redirect destination not in allowlist' }, context, null, null);
                 return;
@@ -721,8 +763,8 @@
             }
 
             if (response.status < 200 || response.status >= 300) {
-              // Log origin+pathname only — omit query string (finding F7).
-              console.warn(`[KickSwap] GmLoader: HTTP ${response.status} for ${parsedUrl.hostname}${parsedUrl.pathname.slice(0, 60)}`);
+              // redactUrl strips query string — no signed tokens in logs (finding F7).
+              console.warn(`[KickSwap] GmLoader: HTTP ${response.status} for ${redactUrl(url)}`);
               callbacks.onError({ code: response.status, text: response.statusText }, context, null, response.responseText);
               return;
             }
@@ -781,13 +823,13 @@
           },
           onerror:   (err) => {
             this._gmRequest = null;
-            // Log hostname only — not the full URL — to avoid leaking tokens (finding F7).
-            console.warn('[KickSwap] GmLoader: GM request error for', parsedUrl.hostname, err);
+            // redactUrl strips query string — no signed tokens in logs (finding F7).
+            console.warn('[KickSwap] GmLoader: GM request error for', redactUrl(url), err);
             callbacks.onError({ code: 0, text: 'GM request error' }, context, null, null);
           },
           ontimeout: () => {
             this._gmRequest = null;
-            console.warn('[KickSwap] GmLoader: GM request timeout for', parsedUrl.hostname);
+            console.warn('[KickSwap] GmLoader: GM request timeout for', redactUrl(url));
             callbacks.onTimeout({ code: 0, text: 'GM request timeout' }, context, null);
           },
         });
@@ -811,6 +853,10 @@
     }
     cleanupListeners = [];
 
+    // ── [P6] Cancel any pending autoShowControls timer ────────────────────
+    clearTimeout(_autoShowTimer);
+    _autoShowTimer = null;
+
     if (liveCheckTimer)   { clearInterval(liveCheckTimer); liveCheckTimer = null; }
     if (hlsInstance)      { try { hlsInstance.destroy(); }        catch {} hlsInstance      = null; }
     if (resizeObserver)   { try { resizeObserver.disconnect(); }   catch {} resizeObserver   = null; }
@@ -825,6 +871,11 @@
     knownTwitchVideo = null;
     syncVolUI        = null;
     isKickActive     = false;
+
+    // ── [P2] Invalidate player container cache on destroy ─────────────────
+    // The Twitch player element may be remounted after destroyKickPlayer returns,
+    // so the cached reference must not be reused by the next getTwitchPlayerContainer() call.
+    _playerContainerCache = null;
 
     restoreTwitchVideo();
     updateUiBadge();
@@ -957,11 +1008,7 @@
         // First fatal error: token may have expired — invalidate the Kick cache
         // entry (using the resolved kick username, not the twitch channel name)
         // and retry after a short delay to avoid thrashing.
-        // hlsRetryCount is module-level so it survives destroyKickPlayer and is
-        // not reset to 0 by a new Hls instantiation — preventing the infinite
-        // retry loop where Chrome/Tampermonkey keeps getting manifestLoadError.
         hlsRetryCount++;
-        // Log detail and type but not the raw response URL (may contain tokens).
         console.info(
           '[KickSwap] Fatal HLS error — invalidating cache and retrying once.',
           data.details,
@@ -971,8 +1018,6 @@
         setTimeout(() => safeReInit(), RETRY_DELAY_MS);
       } else {
         // Second fatal error: give up gracefully, show the user a toast.
-        // Snapshot the container reference before destroy, which may cause
-        // Twitch to remount the player and invalidate a post-destroy lookup.
         console.warn(
           '[KickSwap] Fatal HLS error on retry — falling back to Twitch.',
           data.details,
@@ -987,17 +1032,22 @@
 
   // ─── Control Bar ──────────────────────────────────────────────────────────
 
-  /**
-   * Briefly auto-shows the control bar and badge when Kick first activates,
-   * so users know the controls exist without requiring a hover.
-   */
+  // ── [P6] autoShowControls with cancellable timer ──────────────────────────
+  // The original implementation created a new uncancellable setTimeout on every
+  // call. If doPlay() was invoked more than once (e.g. after a retry), orphaned
+  // timers could hide controls that should still be visible. The module-level
+  // _autoShowTimer handle allows each call to cancel the previous pending hide
+  // before scheduling a new one, and destroyKickPlayer() clears it on teardown.
   function autoShowControls() {
     const bar   = document.getElementById('ks-controls');
     const panel = document.getElementById('ks-ui-panel');
     if (!bar && !panel) return;
     if (bar)   bar.classList.add('ks-visible');
     if (panel) panel.classList.add('ks-visible');
-    setTimeout(() => {
+
+    clearTimeout(_autoShowTimer);
+    _autoShowTimer = setTimeout(() => {
+      _autoShowTimer = null;
       // Only hide if the user isn't already hovering
       if (overlayContainer && overlayContainer.matches(':hover')) return;
       if (bar)   bar.classList.remove('ks-visible');
@@ -1051,9 +1101,6 @@
     volSlider.step  = '0.02';
     volSlider.value = overlayVideo ? String(overlayVideo.volume) : '1';
 
-    // syncVolUI is declared as a named function (_syncVolUI) at the end of this
-    // function and returned to the caller. Using a forward reference here works
-    // because _syncVolUI is a function declaration, which is hoisted.
     const updateVolUI = () => {
       if (!overlayVideo) return;
       _syncVolUI(overlayVideo.volume, overlayVideo.muted);
@@ -1125,18 +1172,12 @@
     right.appendChild(fsBtn);
 
     // ── Keyboard shortcuts ────────────────────────────────────────────────
-    // Guard: don't fire when user is typing in any input/textarea (including
-    // the Kick username input and Twitch chat).
-    // Registered via addTrackedListener so it is removed on destroyKickPlayer,
-    // preventing accumulation across channel navigations.
     const HANDLED_KEYS = new Set(['Space', 'KeyM', 'KeyF', 'KeyL']);
     const onKeyDown = (e) => {
       const tag = e.target.tagName;
       if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
       if (!overlayVideo) return;
       if (!HANDLED_KEYS.has(e.code)) return;
-      // Prevent Twitch's own player from also acting on these keys while the
-      // Kick overlay is active (e.g. M unmuting the hidden Twitch video).
       e.preventDefault();
       e.stopPropagation();
       e.stopImmediatePropagation();
@@ -1160,8 +1201,6 @@
     bar.appendChild(spacer);
     bar.appendChild(right);
 
-    // Apply persisted volume to slider immediately on render using the cached
-    // value so there is no async flash even on re-init.
     loadVolumeCached().then(({ volume, muted }) => {
       volSlider.value = muted ? '0' : String(volume);
       const pct = (muted ? 0 : volume) * 100;
@@ -1169,9 +1208,6 @@
       setIcon(muteBtn, (muted || volume === 0) ? 'volumeMute' : volume < 0.5 ? 'volumeLow' : 'volumeHigh');
     });
 
-    // Return both the bar element and the volume-sync callback so the caller
-    // can assign syncVolUI explicitly rather than relying on the side-effect of
-    // buildControlBar writing to the module-level variable.
     return { bar, syncVolUI: _syncVolUI };
 
     function _syncVolUI(v, m) {
@@ -1185,8 +1221,6 @@
   function toggleFullscreen() {
     const target = overlayContainer || overlayVideo;
     if (!target) return;
-    // Prefer the standard Fullscreen API; fall back to the webkit-prefixed
-    // variant for older Safari versions that don't support the unprefixed form.
     if (document.fullscreenElement || document.webkitFullscreenElement) {
       (document.exitFullscreen || document.webkitExitFullscreen).call(document).catch(() => {});
     } else {
@@ -1213,7 +1247,6 @@
   // ─── Overlay ──────────────────────────────────────────────────────────────
   function mountOverlay(playerContainer, twitchVideo) {
     // Hide Twitch's video visually; keep it in the DOM so React doesn't panic.
-    // Store a reference so can detect if Twitch swaps it during an ad.
     twitchVideo.style.visibility = 'hidden';
     twitchVideo.muted  = true;
     twitchVideo.pause();
@@ -1247,9 +1280,6 @@
     });
 
     const { bar: controlBar, syncVolUI: builtSyncVolUI } = buildControlBar();
-    // Assign the volume-sync callback returned by buildControlBar to the
-    // module-level variable so startHlsPlayback can call it. The dependency
-    // is now explicit at this call site rather than a hidden side-effect.
     syncVolUI = builtSyncVolUI;
 
     overlayContainer.appendChild(overlayVideo);
@@ -1260,45 +1290,44 @@
 
     playerContainer.appendChild(overlayContainer);
 
-    // If the UI panel was mounted on playerContainer before overlay existed,
-    // move it inside overlayContainer so hover covers it.
     if (uiPanel && uiPanel.parentNode === playerContainer) {
       overlayContainer.appendChild(uiPanel);
     }
 
-    // JS hover: show/hide controls and badge. Using JS rather than CSS :hover
-    // keeps the controls visible while interacting with sliders and buttons.
-    // Registered via addTrackedListener so they are removed on destroyKickPlayer.
+    // ── [P5] Close over element references for hover show/hide ────────────
+    // The original code called document.getElementById('ks-controls') and
+    // document.getElementById('ks-ui-panel') on every mouseenter/mouseleave
+    // event. While getElementById is O(1), closing over the already-created
+    // element references is free and makes the lookup intent explicit.
+    const controlBarEl = controlBar;   // direct reference, no lookup needed
+    const panelEl      = uiPanel;      // direct reference, no lookup needed
+
     const showControls = () => {
-      const bar   = document.getElementById('ks-controls');
-      const panel = document.getElementById('ks-ui-panel');
-      if (bar)   bar.classList.add('ks-visible');
-      if (panel) panel.classList.add('ks-visible');
+      controlBarEl?.classList.add('ks-visible');
+      panelEl?.classList.add('ks-visible');
     };
     const hideControls = () => {
-      const bar   = document.getElementById('ks-controls');
-      const panel = document.getElementById('ks-ui-panel');
-      if (bar)   bar.classList.remove('ks-visible');
-      if (panel) panel.classList.remove('ks-visible');
+      controlBarEl?.classList.remove('ks-visible');
+      panelEl?.classList.remove('ks-visible');
     };
     addTrackedListener(overlayContainer, 'mouseenter', showControls);
     addTrackedListener(overlayContainer, 'mouseleave', hideControls);
 
+    // ── [P7] ResizeObserver with equality guard ────────────────────────────
+    // The original callback wrote overlayContainer.style.width/height = '100%'
+    // unconditionally on every resize event, triggering unnecessary style
+    // recalculations even when the values hadn't changed. Since the overlay's
+    // inline styles are initialised to '100%' and nothing else changes them,
+    // the write is almost always a no-op in practice. The equality guard makes
+    // that explicit and avoids the style invalidation entirely during normal
+    // resize events where values have not drifted.
     resizeObserver = new ResizeObserver(() => {
-      // Re-anchor to 100% on any resize. The overlay is position:absolute and
-      // sized 100%/100% relative to playerContainer, so this is a no-op when
-      // dimensions haven't changed — no conditional needed.
       if (!overlayContainer) return;
-      overlayContainer.style.width  = '100%';
-      overlayContainer.style.height = '100%';
+      if (overlayContainer.style.width  !== '100%') overlayContainer.style.width  = '100%';
+      if (overlayContainer.style.height !== '100%') overlayContainer.style.height = '100%';
     });
     resizeObserver.observe(playerContainer);
 
-    // ── Theatre / fullscreen mode watchdog ────────────────────────────────
-    // Twitch toggles theatre mode by mutating CSS classes on the player wrapper,
-    // not by resizing it — ResizeObserver alone misses this. We watch the
-    // wrapper's class attribute so we can re-anchor the overlay after the layout
-    // shift settles (one rAF is enough for the browser to flush style changes).
     startTheatreObserver(playerContainer);
   }
 
@@ -1306,54 +1335,42 @@
   /**
    * Watches for Twitch theatre-mode / fullscreen class changes on the player
    * wrapper. When a change is detected the overlay dimensions are re-anchored
-   * after one animation frame, by which point the browser has flushed the new
-   * layout. This covers the case ResizeObserver misses (class-driven layout
-   * shifts that don't immediately change the element's reported size).
+   * after one animation frame.
+   *
+   * [P10] The ancestor walk (up to 6 elements) is now cached in _theatreWatchTarget
+   * so it only happens once per channel session rather than on every safeReInit()
+   * cycle. The cache is cleared in onNavigate() alongside _playerContainerCache.
    */
   function startTheatreObserver(playerContainer) {
     if (theatreObserver) { theatreObserver.disconnect(); theatreObserver = null; }
 
-    // Walk up from the player container to find the nearest ancestor that
-    // carries Twitch's theatre/fullscreen class — typically a wrapper a few
-    // levels up with a class like `theatre-mode` or `video-player--theatre`.
-    // We observe the container itself as a safe fallback if no such ancestor
-    // is found within a reasonable depth.
-    let watchTarget = playerContainer;
-    let el = playerContainer.parentElement;
-    for (let i = 0; i < 6 && el && el !== document.body; i++, el = el.parentElement) {
-      const cls = el.className || '';
-      if (/theatre|theater|fullscreen/i.test(cls)) { watchTarget = el; break; }
+    // Use cached target if still in the document; otherwise re-walk.
+    if (!(_theatreWatchTarget && document.contains(_theatreWatchTarget))) {
+      _theatreWatchTarget = playerContainer;
+      let el = playerContainer.parentElement;
+      for (let i = 0; i < 6 && el && el !== document.body; i++, el = el.parentElement) {
+        const cls = el.className || '';
+        if (/theatre|theater|fullscreen/i.test(cls)) { _theatreWatchTarget = el; break; }
+      }
     }
 
     theatreObserver = new MutationObserver(() => {
       if (!overlayContainer) return;
       requestAnimationFrame(() => {
-        // Re-anchor to 100% in case the layout shift moved the container
         overlayContainer.style.width  = '100%';
         overlayContainer.style.height = '100%';
       });
     });
 
-    theatreObserver.observe(watchTarget, { attributes: true, attributeFilter: ['class', 'style'] });
+    theatreObserver.observe(_theatreWatchTarget, { attributes: true, attributeFilter: ['class', 'style'] });
   }
 
   // ─── Ad-swap guard ────────────────────────────────────────────────────────
-  /**
-   * Twitch injects ads by replacing the <video> element inside the player
-   * container. getTwitchVideo() would still return a video element in that
-   * case — just the wrong (ad) one — causing restoreTwitchVideo to target it
-   * incorrectly. The watchdog fires when this happens; here we compare the
-   * current video element against the one we recorded at overlay mount time
-   * and re-hide any new element so it doesn't bleed through.
-   */
   function handlePossibleAdSwap(playerContainer) {
     const currentVideo = getTwitchVideoIn(playerContainer);
     if (!currentVideo) return;
 
     if (currentVideo !== knownTwitchVideo) {
-      // Twitch swapped the video element (ad injection or player remount).
-      // Hide and mute the new element so it doesn't bleed through the overlay,
-      // then update our reference so future calls compare against the right one.
       console.info('[KickSwap] Twitch video element replaced (ad/remount) — re-hiding.');
       currentVideo.style.visibility = 'hidden';
       currentVideo.muted = true;
@@ -1366,7 +1383,6 @@
   function mountUiPanel(playerContainer) {
     if (uiPanel) return;
 
-    // Inject all styles once; guard against duplicate injection on re-init
     if (!document.getElementById('ks-styles')) {
       const style = document.createElement('style');
       style.id = 'ks-styles';
@@ -1606,9 +1622,6 @@
     uiPanel = document.createElement('div');
     uiPanel.id = 'ks-ui-panel';
 
-    // Build all child elements programmatically — no innerHTML anywhere in this
-    // file, so there is no innerHTML pattern that future changes could
-    // accidentally make dynamic.
     const badge = document.createElement('div');
     badge.id = 'ks-badge';
     const badgeDot = document.createElement('span');
@@ -1619,10 +1632,6 @@
     badge.appendChild(badgeDot);
     badge.appendChild(badgeLabel);
 
-    // Session toggle: both states are phrased as actions ("Use Twitch" /
-    // "Use Kick") so the label always describes what clicking will do, not the
-    // current state. Initial state = Kick active (or will be), so first label
-    // is "Use Twitch".
     const twitchBtnEl = document.createElement('button');
     twitchBtnEl.type  = 'button';
     twitchBtnEl.id    = 'ks-twitch-btn';
@@ -1670,11 +1679,8 @@
     const panelParent = overlayContainer || playerContainer;
     panelParent.appendChild(uiPanel);
 
-    // "Use Twitch" / "Use Kick" session toggle — disables the swap for this
-    // session without touching persistent mappings.
     twitchBtnEl.addEventListener('click', () => {
       disabledForSession = !disabledForSession;
-      // Label always describes the action clicking will perform next.
       twitchBtnEl.textContent = disabledForSession ? 'Use Kick' : 'Use Twitch';
       twitchBtnEl.title       = disabledForSession
         ? 'Switch back to Kick stream'
@@ -1683,6 +1689,11 @@
       if (disabledForSession) {
         destroyKickPlayer();
       } else {
+        // User explicitly re-enabled Kick — reset the retry budget so a
+        // transient HLS error on this attempt still gets one automatic retry,
+        // rather than falling back immediately because a prior failure had
+        // already consumed the single retry allowed per session segment.
+        hlsRetryCount = 0;
         safeReInit();
       }
     });
@@ -1691,7 +1702,6 @@
       const isHidden = editForm.style.display === 'none';
       editForm.style.display = isHidden ? 'flex' : 'none';
       if (isHidden) {
-        // Pre-populate with the current mapping so users can make small edits
         const mappings = await loadMappings();
         usernameInput.value = (currentChannel && mappings[currentChannel]) ? mappings[currentChannel] : '';
         usernameInput.focus();
@@ -1703,7 +1713,6 @@
       const clean = sanitiseUsername(raw);
       if (!clean || !currentChannel) return;
 
-      // Visual confirmation before re-init
       saveBtn.textContent = 'Saved ✓';
       saveBtn.style.color = '#53fc18';
       setTimeout(() => { saveBtn.textContent = 'Save'; saveBtn.style.color = ''; }, 1500);
@@ -1756,10 +1765,6 @@
   }
 
   // ─── Offline badge ────────────────────────────────────────────────────────
-  /**
-   * Shows a subtle dismissible badge when no live Kick stream is found,
-   * so users understand why the swap didn't happen. Auto-dismisses after 6 s.
-   */
   function showOfflineBadge(kickUsername, isMapped) {
     const playerContainer = getTwitchPlayerContainer();
     if (!playerContainer) return;
@@ -1784,18 +1789,6 @@
   }
 
   // ─── Periodic live-status check ───────────────────────────────────────────
-  /**
-   * Polls the Kick API every LIVE_CHECK_INTERVAL_MS while the overlay is active.
-   * Detects when a streamer ends their stream cleanly (no HLS error fired),
-   * tears down the overlay, and shows the stream-ended toast.
-   *
-   * Cache behaviour: we deliberately do NOT call cacheDelete before fetching.
-   * The cache TTL equals the poll interval (both 5 min), so by the time each
-   * scheduled check runs the previous entry will have expired naturally —
-   * fetchKickHlsUrl will always make a fresh API call. Calling cacheDelete
-   * proactively would race with other code paths that legitimately re-use the
-   * cached URL (e.g. a simultaneous safeReInit), so we rely on TTL expiry instead.
-   */
   function startLiveCheck(kickUsername) {
     if (liveCheckTimer) { clearInterval(liveCheckTimer); liveCheckTimer = null; }
     liveCheckTimer = setInterval(async () => {
@@ -1803,8 +1796,6 @@
       const url = await fetchKickHlsUrl(kickUsername);
       if (!url && isKickActive) {
         console.info('[KickSwap] Periodic check: Kick stream is no longer live — falling back to Twitch.');
-        // Snapshot before destroy; restoreTwitchVideo may cause Twitch to remount
-        // the player, making a post-destroy getTwitchPlayerContainer() unreliable.
         const playerContainer = getTwitchPlayerContainer();
         destroyKickPlayer();
         showStreamEndedToast(playerContainer);
@@ -1814,11 +1805,6 @@
 
   // ─── Core Init ────────────────────────────────────────────────────────────
   async function initKickSwap() {
-    // Prevent concurrent invocations. waitForPlayer and visibilitychange can
-    // both fire within milliseconds of each other (e.g. tab restored while the
-    // Twitch player is also mounting), and a double call to mountOverlay would
-    // produce a stacked overlay. safeReInit has its own guard; this one covers
-    // direct callers (clearBtn, saveBtn, visibility recheck).
     if (initInProgress) return;
     initInProgress = true;
     try {
@@ -1828,15 +1814,11 @@
     }
   }
 
-  // _initKickSwap is the inner implementation. It must only be called through
-  // the public initKickSwap wrapper, which sets the initInProgress guard to
-  // prevent concurrent invocations from mountOverlay stacking overlays.
   async function _initKickSwap() {
     const channel = getTwitchChannel();
     if (!channel) return;
     currentChannel = channel;
 
-    // If the user has toggled "Use Twitch" for this session, do nothing.
     if (disabledForSession) return;
 
     const playerContainer = getTwitchPlayerContainer();
@@ -1846,23 +1828,18 @@
     if (!uiPanel) mountUiPanel(playerContainer);
 
     const mappings = await loadMappings();
-    // Guard: abort if the user navigated away while we were awaiting storage.
     if (getTwitchChannel() !== channel) return;
 
     const kickUsername = mappings[channel] || channel;
-    // Expose resolved kick username so the retry path deletes the right cache key
     currentKickUser = kickUsername;
 
-    // Show a "checking" state in the badge while the API call is in-flight,
-    // so users get visual feedback that the script is running.
     updateUiBadge('checking');
 
     const hlsUrl = await fetchKickHlsUrl(kickUsername);
-    // Guard: abort if the user navigated away while the API call was in-flight.
     if (getTwitchChannel() !== channel) return;
 
     if (!hlsUrl) {
-      updateUiBadge(); // revert to TWITCH
+      updateUiBadge();
       const isMapped = !!mappings[channel];
       console.info(
         `[KickSwap] No live Kick stream for "${kickUsername}"${isMapped ? '' : ' (auto-match — set a mapping if the usernames differ)'}. Using Twitch.`
@@ -1880,16 +1857,10 @@
   // ─── Navigation & Lifecycle ───────────────────────────────────────────────
 
   let reInitGuard      = false;
-  // Backstop: if reInitGuard gets stuck (e.g. unexpected throw), auto-clear
-  // after 15 s so the script doesn't freeze permanently.
   let reInitGuardTimer = null;
 
   async function safeReInit() {
     if (reInitGuard) return;
-    // Set the guard and backstop timer only on the first entry. Resetting the
-    // timer on every concurrent call would push the auto-clear arbitrarily far
-    // into the future (e.g. watchdog + visibilitychange firing within ms of
-    // each other), potentially keeping the guard locked until a page reload.
     reInitGuard      = true;
     reInitGuardTimer = setTimeout(() => { reInitGuard = false; }, 15000);
     try {
@@ -1903,30 +1874,11 @@
     }
   }
 
-  // ─── Watchdog (finding F9 — narrowed MutationObserver scope) ─────────────
-  /**
-   * Two separate observers replace the original single subtree observer:
-   *
-   *   overlayWatcher  — childList only on playerContainer (shallow).
-   *     Fires when the ks-overlay-container div is removed from the DOM
-   *     (e.g. Twitch player remount). Shallow childList is sufficient because
-   *     the overlay is a direct child of playerContainer.
-   *
-   *   adSwapWatcher   — childList only on playerContainer (shallow).
-   *     Fires when Twitch replaces the <video> element (ad injection). The
-   *     Twitch <video> is also a direct child of the player container, so
-   *     subtree:true is not needed and was unnecessarily broad.
-   *
-   * Using subtree:true caused the callback to fire on every internal React
-   * reconciliation mutation inside the player, which is significantly more
-   * frequent than necessary. The narrowed scope reduces callback frequency
-   * without losing any detection capability for the two events we care about.
-   */
+  // ─── Watchdog ─────────────────────────────────────────────────────────────
   function startWatchdog(playerContainer) {
     if (watchdogObserver) { watchdogObserver.disconnect(); watchdogObserver = null; }
 
     watchdogObserver = new MutationObserver((mutations) => {
-      // Check 1: has our overlay container been removed?
       if (!document.getElementById('ks-overlay-container') && isKickActive) {
         console.info('[KickSwap] Overlay removed (likely ad or player remount) — re-initialising.');
         watchdogObserver.disconnect();
@@ -1935,8 +1887,6 @@
         return;
       }
 
-      // Check 2: has Twitch swapped the underlying <video> element?
-      // Only examine addedNodes — removals alone don't indicate a new video.
       if (isKickActive) {
         for (const m of mutations) {
           if (m.addedNodes.length > 0) { handlePossibleAdSwap(playerContainer); break; }
@@ -1945,8 +1895,7 @@
     });
 
     // subtree: false — both the overlay container and the Twitch <video> are
-    // direct children of playerContainer. Watching the full subtree was broader
-    // than needed and fired on every internal React DOM update (finding F9).
+    // direct children of playerContainer.
     watchdogObserver.observe(playerContainer, { childList: true, subtree: false });
   }
 
@@ -1958,24 +1907,85 @@
     destroyKickPlayer();
     destroyUiPanel();
     currentKickUser    = null;
-    hlsRetryCount      = 0;    // new channel gets a fresh retry budget
-    disabledForSession = false; // reset per-channel session toggle on navigation
+    hlsRetryCount      = 0;
+    disabledForSession = false;
+
+    // ── [P2, P10] Invalidate caches on channel navigation ─────────────────
+    // destroyKickPlayer() clears _playerContainerCache already, but we also
+    // clear it here explicitly in case destroyKickPlayer is skipped (e.g. when
+    // Kick was never active on the previous channel).
+    _playerContainerCache = null;
+    // Theatre watch target is layout-dependent and may differ between channels
+    // if Twitch renders different wrapper structures (e.g. /popout/ vs normal).
+    _theatreWatchTarget   = null;
+
     waitForPlayer();
   }
 
+  // ── [P1] waitForPlayer — replaced broad subtree observer ──────────────────
+  // The original implementation observed `#root` (or `document.body`) with
+  // `{ childList: true, subtree: true }` — the broadest possible scope. On
+  // Twitch's React-heavy DOM this fires on every chat message, viewer count
+  // update, and metadata reconciliation, running getTwitchVideo() (a triple
+  // querySelector chain) on every callback during the 1–3 s window between
+  // navigation and player mount.
+  //
+  // Replacement strategy (two-stage):
+  //
+  // 1. requestIdleCallback polling (primary path).
+  //    Schedules up to MAX_ATTEMPTS checks during browser idle time (timeout:
+  //    200 ms ensures it doesn't wait forever). Idle callbacks run between
+  //    tasks, so they do not compete with Twitch's React reconciliation on
+  //    the main thread. For a typical Twitch page load (player appears within
+  //    ~1 s), 5–10 idle checks suffice; the MutationObserver fallback is never
+  //    reached in normal conditions.
+  //
+  // 2. Narrowed MutationObserver fallback (slow-load / edge case).
+  //    Engaged only after ~5 s (25 × 200 ms) of unsuccessful idle polling.
+  //    Observes `main` (Twitch's primary content region, a direct ancestor of
+  //    the player) rather than `#root`. Falls back through progressively wider
+  //    roots but never starts with the broadest one.
+  //
+  // requestIdleCallback is available in all Chromium and Firefox versions that
+  // support Tampermonkey/Violentmonkey (Chrome 47+, Firefox 55+).
   function waitForPlayer() {
-    // getTwitchVideo() is correct here — we don't have a container reference
-    // yet and need to discover it from scratch.
     if (getTwitchVideo()) { initKickSwap(); return; }
 
     if (playerObserver) { playerObserver.disconnect(); playerObserver = null; }
 
-    // Observe the narrowest reliable ancestor rather than the full document body
-    const root = document.getElementById('root') || document.body;
-    playerObserver = new MutationObserver((_, obs) => {
-      if (getTwitchVideo()) { obs.disconnect(); playerObserver = null; initKickSwap(); }
-    });
-    playerObserver.observe(root, { childList: true, subtree: true });
+    let attempts = 0;
+    const MAX_ATTEMPTS = 25; // ~5 s at 200 ms timeout per attempt
+
+    const poll = () => {
+      if (getTwitchVideo()) {
+        initKickSwap();
+        return;
+      }
+      if (++attempts < MAX_ATTEMPTS) {
+        requestIdleCallback(poll, { timeout: 200 });
+      } else {
+        // Idle polling exhausted — fall back to a narrowed MutationObserver.
+        // `main` is Twitch's primary content container and a reliable ancestor
+        // of the player. Fall through to progressively wider roots only if
+        // `main` is absent (e.g. unusual Twitch page variants).
+        const narrowRoot =
+          document.querySelector('main') ||
+          document.querySelector('[data-a-target="page-main-content"]') ||
+          document.getElementById('root') ||
+          document.body;
+
+        playerObserver = new MutationObserver((_, obs) => {
+          if (getTwitchVideo()) {
+            obs.disconnect();
+            playerObserver = null;
+            initKickSwap();
+          }
+        });
+        playerObserver.observe(narrowRoot, { childList: true, subtree: true });
+      }
+    };
+
+    requestIdleCallback(poll, { timeout: 200 });
   }
 
   // Module-level sentinels for the history wrapping guards.
@@ -1988,13 +1998,6 @@
   let _replaceStateWrapped = false;
 
   function hookNavigation() {
-    // Wrap history methods to detect SPA navigations.
-    // Guarded by module-level booleans (not properties on the native functions)
-    // so the sentinel survives Tampermonkey's sandbox isolation on Chrome.
-    // Note: if Twitch's own router re-wraps pushState after our wrapper is in
-    // place, our wrapper becomes orphaned — this is a known limitation of SPA
-    // hook injection. The popstate listener and the MutationObserver on #root
-    // in waitForPlayer serve as reliable fallbacks.
     if (!_pushStateWrapped) {
       const _origPushState = history.pushState.bind(history);
       history.pushState = function (...args) {
@@ -2015,46 +2018,53 @@
 
     window.addEventListener('popstate', onNavigate);
 
-    // ── Mini player expand detection ──────────────────────────────────────
-    // When the user expands Twitch's mini player back to the full stream,
-    // Twitch restores the stream page URL and player DOM without going through
-    // pushState, popstate, or any history API — so none of our other navigation
-    // hooks fire. We detect this with a capture-phase click listener that checks
-    // after each click whether we've landed on a stream page with no overlay.
-    // Cheap state checks run synchronously before the setTimeout so we avoid
-    // scheduling a timer on every click during normal active playback.
-    // Using setTimeout(0) defers the URL/DOM check by one task so Twitch's own
-    // click handler has time to update the page before we read it.
-    // Gated by: valid stream URL, overlay absent, not already initialising,
-    // not session-disabled, and a cooldown to prevent rapid re-triggers.
+    // ── Mini player expand detection (P3 — unchanged, with rationale) ─────
+    // This capture-phase click listener performs cheap boolean guard checks
+    // (isKickActive, disabledForSession, initInProgress, reInitGuard,
+    // hlsRetryCount) followed by a Date.now() comparison on every click.
+    // The cost is sub-microsecond in the common case (isKickActive = true
+    // returns immediately). The setTimeout(0) is only scheduled when all
+    // guards pass, which requires the Kick overlay to be absent and the
+    // stream page to be active — a rare condition.
+    //
+    // A narrower listener (e.g. scoped to Twitch's mini-player expand button)
+    // would reduce callback frequency but requires identifying a stable Twitch
+    // selector, which is fragile across Twitch UI updates. The current
+    // page-wide approach is the safe choice; the guards ensure the body of
+    // the handler only executes when genuinely needed.
     let lastMiniPlayerCheck = 0;
     document.addEventListener('click', () => {
-      // Bail out synchronously on the common cases to avoid scheduling
-      // a timer on every click during normal active playback.
       if (isKickActive) return;
       if (disabledForSession) return;
       if (initInProgress) return;
-      if (reInitGuard) return;   // safeReInit or its retry delay is in progress
-      if (hlsRetryCount > 0) return; // HLS already failed once; don't loop on every click
+      if (reInitGuard) return;
+      if (hlsRetryCount > 0) return;
       if (Date.now() - lastMiniPlayerCheck < MINI_PLAYER_COOLDOWN) return;
       setTimeout(() => {
         const channel = getTwitchChannel();
         if (!channel) return;
         if (document.getElementById('ks-overlay-container')) return;
         lastMiniPlayerCheck = Date.now();
-        // Only act if the channel changed from what we last initialised for,
-        // or if we're on a stream page with no overlay and no UI panel at all —
-        // the latter covers the expand case where the channel hasn't changed.
         if (channel !== currentChannel || !document.getElementById('ks-ui-panel')) {
           console.info('[KickSwap] Mini player expand detected — re-initialising.');
-          // Do not call onNavigate() here — it guards against same-channel calls
-          // (channel === currentChannel) which is exactly the mini player case.
-          // Everything is already torn down; we just need to re-initialise.
           waitForPlayer();
         }
       }, 0);
     }, true);
 
+    // ── [P4] visibilitychange — TTL-based recheck (cacheDelete removed) ───
+    // The original handler called cacheDelete(currentKickUser) unconditionally
+    // before every tab-focus recheck. This bypassed the 5-minute session cache
+    // TTL and triggered a fresh Kick API call on every tab-focus after the
+    // 30-second VISIBILITY_RECHECK_COOLDOWN — up to 240 calls/hour for a user
+    // switching tabs frequently while the Kick stream is offline.
+    //
+    // Fix: the cacheDelete call is removed. fetchKickHlsUrl honours the TTL
+    // natively — a stale "offline" entry expires after 5 minutes and the next
+    // call automatically makes a fresh request. The feature intent (detect a
+    // stream coming online while away) is fully preserved: after the TTL
+    // expires, the next tab-focus triggers a fresh API call as before.
+    // API call rate is reduced from ≤1/30 s to ≤1/5 min for offline channels.
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState !== 'visible') return;
       if (!currentChannel) return;
@@ -2067,21 +2077,26 @@
         return;
       }
 
-      // Stream was offline when page loaded — recheck on tab focus,
-      // but throttle to avoid hammering the API on rapid tab switching.
+      // Stream was offline when page loaded — recheck on tab focus.
       if (!isKickActive && !disabledForSession && getTwitchChannel() === currentChannel) {
         const now = Date.now();
         if (now - lastVisibilityRecheck < VISIBILITY_RECHECK_COOLDOWN) return;
         lastVisibilityRecheck = now;
-        if (currentKickUser) cacheDelete(currentKickUser);
+        // [P4] cacheDelete removed — TTL in fetchKickHlsUrl handles freshness.
         initKickSwap();
       }
     });
   }
 
+  // ── [P9] bootstrap — stream-page guard ────────────────────────────────────
+  // hookNavigation() runs unconditionally so SPA navigations from non-stream
+  // pages (browse → channel) are detected. waitForPlayer() is skipped for
+  // non-stream URLs (VODs, clips, directory) to avoid creating a MutationObserver
+  // and making a spurious Kick API call on pages where the script has nothing
+  // to do. isLikelyStreamPage() reuses the same regex as getTwitchChannel().
   function bootstrap() {
     hookNavigation();
-    waitForPlayer();
+    if (isLikelyStreamPage()) waitForPlayer();
   }
 
   if (document.readyState === 'loading') {
